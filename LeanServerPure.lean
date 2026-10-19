@@ -17,7 +17,8 @@
 --   Protocol  : HTTP/2, HTTP/3, HPACK, QUIC, WebSocket, gRPC, WSCompression (9 modules)
 --   Proofs    : 169 concrete test-vector theorems (1 module)
 --   Spec      : Formal specifications, refinement proofs, invariants (11 modules)
---   Server    : Pure concurrency primitives (1 module)
+--   HTTP/Web  : Canonical application types, generic routing/middleware, templates, SQL builders
+--   Server    : Lean concurrency helpers, pure CORS/negotiation/compression
 --
 -- What's NOT included (requires C FFI or system IO):
 --   Crypto/FFI.lean        — OpenSSL FFI bindings (optional performance backend)
@@ -25,7 +26,7 @@
 --   Server/HTTPServer*     — Full HTTPS server (epoll, sockets, networking)
 --   Server/LoadBalancer    — Load balancer (socket FFI)
 --   Server/Production,Metrics,etc. — Server middleware (depends on HTTPServer)
---   Web/*                  — Web applications (depends on HTTPServer)
+--   Db.Web                 — Optional driver helpers (explicit manager argument)
 --
 -- Usage from another project:
 --   In your lakefile.toml:
@@ -40,6 +41,18 @@
 --     import LeanServer.Protocol.HTTP2
 
 -- ── Core ──────────────────────────────────────────────────
+import LeanServer.HTTP.Types
+import LeanServer.HTTP.Router
+import LeanServer.HTTP.Codec
+import LeanServer.HTTP.Health
+import LeanServer.HTTP.QPACK
+import LeanServer.HTTP.Middleware
+import LeanServer.Web.Framework
+import LeanServer.Web.WebApplication
+import LeanServer.Web.WebApplicationSimple
+import LeanServer.Server.CORSMiddleware
+import LeanServer.Server.ContentNegotiation
+import LeanServer.Server.ResponseCompression
 import LeanServer.Core.Basic
 import LeanServer.Core.Base64
 import LeanServer.Core.BufferPool

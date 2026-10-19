@@ -1454,13 +1454,14 @@ def getNonce (iv : ByteArray) (seqNum : Nat) : ByteArray :=
   LeanServer.AES.xorBytes iv seqBytes
 
 /-- Build TLS 1.3 Flight 2 Messages (EncryptedExtensions, Cert, CV, Finished) -/
-def buildFlight2Messages (session : TLSSessionTLS) (keys : HandshakeKeys) (quicParams : Option ByteArray) (intermediateCerts : Array ByteArray := #[]) : IO (ByteArray × TLSSessionTLS) := do
+def buildFlight2Messages (session : TLSSessionTLS) (keys : HandshakeKeys) (quicParams : Option ByteArray) (intermediateCerts : Array ByteArray := #[])
+    (certPath : String := "cert.pem") (keyPath : String := "key.pem") : IO (ByteArray × TLSSessionTLS) := do
   -- 1. EncryptedExtensions
   let eeMsg := buildEncryptedExtensions session.alpnProtocol quicParams
   let transcript := session.transcript ++ eeMsg
 
   -- 2. Certificate (with optional chain + OCSP stapling)
-  let certOpt ← loadCertificateDER "cert.pem"
+  let certOpt ← loadCertificateDER certPath
   let certData := match certOpt with
     | some c => c.data
     | none => ByteArray.mk #[0] -- Fallback (will fail)
@@ -1484,7 +1485,7 @@ def buildFlight2Messages (session : TLSSessionTLS) (keys : HandshakeKeys) (quicP
   let signInput := signPrefix ++ signLabel ++ ByteArray.mk #[0x00] ++ transcriptHash
 
   -- Load Private Key for Signing (RSA)
-  let keyOpt ← loadPrivateKey "key.pem"
+  let keyOpt ← loadPrivateKey keyPath
   let rsaPrivKey := match keyOpt with
     | some k => k
     | none => ByteArray.empty -- Will cause sign to fail safely
@@ -1505,8 +1506,9 @@ def buildFlight2Messages (session : TLSSessionTLS) (keys : HandshakeKeys) (quicP
   return (messages, newSession)
 
 /-- Build TLS 1.3 Flight 2 Record (Legacy Wrapper for TCP) -/
-def buildFlight2 (session : TLSSessionTLS) (keys : HandshakeKeys) (quicParams : Option ByteArray) (intermediateCerts : Array ByteArray := #[]) : IO (ByteArray × TLSSessionTLS) := do
-  let (messages, newSession) ← buildFlight2Messages session keys quicParams intermediateCerts
+def buildFlight2 (session : TLSSessionTLS) (keys : HandshakeKeys) (quicParams : Option ByteArray) (intermediateCerts : Array ByteArray := #[])
+    (certPath : String := "cert.pem") (keyPath : String := "key.pem") : IO (ByteArray × TLSSessionTLS) := do
+  let (messages, newSession) ← buildFlight2Messages session keys quicParams intermediateCerts certPath keyPath
 
   -- Encrypt into Record
   -- Use sequence number 0 for the first encrypted record

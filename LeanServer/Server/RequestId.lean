@@ -1,4 +1,4 @@
-import LeanServer.Server.HTTPServer
+import LeanServer.HTTP.Middleware
 
 /-!
 # Request ID Propagation (R24)
@@ -114,56 +114,23 @@ def extractRequestContext (headers : List (String × String))
 
   return { requestId, correlationId, clientIP, startTimeMs := nowMs }
 
-/-- Inject request ID headers into a response -/
-def injectRequestIdHeaders (resp : HTTPResponse) (ctx : RequestContext)
-    (config : RequestIdConfig := {}) : HTTPResponse :=
-  let headers := [(config.outgoingHeader, ctx.requestId)]
-  let headers := if config.setCorrelationId then
-    headers ++ [(config.correlationHeader, ctx.correlationId)]
-  else headers
-  { resp with extraHeaders := resp.extraHeaders ++ headers }
+/-- Per-request identity is carried in Context, never in a process-global reference. -/
+def requestIdMiddlewareWith [Monad m] (generate : m String)
+    (config : RequestIdConfig := {}) : HTTP.Middleware m := fun next ctx => do
+  let id ← match ctx.request.headers.get? config.incomingHeader with
+    | some id => if id.isEmpty then generate else pure id
+    | none => generate
+  let correlationId := (ctx.request.headers.get? config.correlationHeader).getD id
+  let response ← next (ctx.setLocal "request-id" id |>.setLocal "correlation-id" correlationId)
+  let response := response.withHeader config.outgoingHeader id
+  return if config.setCorrelationId then response.withHeader config.correlationHeader correlationId else response
 
-/-- Request ID middleware -/
-def requestIdMiddleware (config : RequestIdConfig := {}) : LeanServer.Middleware := {
-  name := "request-id"
-  apply := fun _ _ _ _ resp =>
-    -- In the middleware pipeline, we don't have access to the request headers,
-    -- so we generate a new ID. The full context extraction happens at the server level.
-    -- Here we just ensure the header exists.
-    let hasId := resp.extraHeaders.any fun (k, _) => k.toLower == config.outgoingHeader.toLower
-    if hasId then resp
-    else { resp with extraHeaders := resp.extraHeaders ++ [(config.outgoingHeader, "generated")] }
-}
+def requestIdMiddleware (config : RequestIdConfig := {}) : HTTP.Middleware IO :=
+  requestIdMiddlewareWith (generateRequestId config.idPrefix) config
 
--- ==========================================
--- Request Context Propagation
--- ==========================================
-
-/-- Global request context storage (thread-local via IO.Ref per request) -/
-initialize currentRequestContextRef : IO.Ref (Option RequestContext) ← IO.mkRef none
-
-/-- Set the current request context (call at start of request handling) -/
-def setRequestContext (ctx : RequestContext) : IO Unit :=
-  currentRequestContextRef.set (some ctx)
-
-/-- Get the current request context -/
-def getRequestContext : IO (Option RequestContext) :=
-  currentRequestContextRef.get
-
-/-- Clear the current request context (call at end of request handling) -/
-def clearRequestContext : IO Unit :=
-  currentRequestContextRef.set none
-
-/-- Run an action with a request context -/
-def withRequestContext (ctx : RequestContext) (action : IO α) : IO α := do
-  setRequestContext ctx
-  try
-    let result ← action
-    clearRequestContext
-    return result
-  catch e =>
-    clearRequestContext
-    throw e
+/-- An explicit ReaderT scope replaces the former global request context. -/
+def withRequestContext (ctx : RequestContext) (action : ReaderT RequestContext m α) : m α :=
+  action ctx
 
 /-- Get the elapsed time since request start -/
 def requestElapsedMs (ctx : RequestContext) : IO Nat := do

@@ -2,7 +2,7 @@
 -- Complete HTTPS server with TLS handshake, HTTP/2, and HTTP/3 over QUIC
 -- Pure Lean 4 implementation with REAL network operations
 
-import LeanServer
+import LeanServerPure
 import LeanServer.Protocol.HTTP2
 import LeanServer.Protocol.WebSocketOverHTTP2
 import LeanServer.Protocol.QUIC
@@ -162,6 +162,12 @@ opaque socketCreate (proto : UInt32) : IO UInt64
 @[extern "lean_bind"]
 opaque socketBind (sock : UInt64) (port : UInt32) : IO Unit
 
+@[extern "lean_bind_address"]
+opaque socketBindAddress (sock : UInt64) (host : @& String) (port : UInt32) : IO Unit
+
+@[extern "lean_socket_recv_bytes"]
+opaque socketRecvBytes (sock : UInt64) (limit : UInt32) : IO ByteArray
+
 @[extern "lean_listen"]
 opaque socketListen (sock : UInt64) (backlog : UInt32) : IO Unit
 
@@ -185,14 +191,11 @@ def recvExhaustive (sock : UInt64) (expected : Nat) (fuel : Nat := expected) : I
         return acc
       else
         let remaining := expected - acc.size
-        let buf := ByteArray.mk (List.replicate remaining 0).toArray
-        -- Flags 0
-        let n ← socketRecv sock buf remaining.toUInt32 0
-        if n == 0 then
+        let chunk ← socketRecvBytes sock remaining.toUInt32
+        if chunk.isEmpty then
           -- Connection closed or error, return what we have
           return acc
         else
-          let chunk := buf.extract 0 n.toNat
           loop (acc ++ chunk) fuel
   loop ByteArray.empty fuel
 
@@ -328,7 +331,57 @@ structure ServerConfig where
   enableServerPush : Bool := true
   healthCheckPath : String := "/health"
   metricsPath : String := "/metrics"
+  enableHTTP1 : Bool := true
+  enableTLS : Bool := false
+  enableHTTP2 : Bool := false
+  enableHTTP3 : Bool := false
+  udpPort : Option UInt16 := none
+  limits : HTTP.Limits := {}
+  requestTimeoutMs : UInt32 := 30000
   deriving Inhabited
+
+/-- Application state is explicit and immutable; protocol state remains in the runtime. -/
+structure Application where
+  handler : HTTP.Handler IO
+  config : ServerConfig
+
+def Application.dispatch (app : Application) (request : HTTP.Request)
+    (connection : HTTP.ConnectionInfo := {}) : IO HTTP.Response := do
+  try
+    let response ← app.handler (HTTP.Context.ofRequest request connection)
+    if response.valid then return response
+    IO.eprintln "Application returned an invalid HTTP response"
+  catch error => IO.eprintln s!"Application error: {error}"
+  return HTTP.Response.text "Internal Server Error" 500
+
+def Application.dispatchFields (app : Application) (version : HTTP.Version)
+    (headers : HTTP.Headers) (body : ByteArray) (peer : String) : IO HTTP.Response :=
+  match HTTP.fromFields version headers body app.config.limits with
+  | .error error => pure error.response
+  | .ok request => app.dispatch request { peerAddress := some peer, secure := true }
+
+def sendAll (sock : UInt64) (bytes : ByteArray) : IO Unit := do
+  let sent ← sendWithRetry sock bytes socketSend
+  if sent.toNat != bytes.size then throw (IO.userError "Incomplete socket write")
+
+/-- Plain HTTP uses the same byte parser and application as TLS HTTP/1.1. -/
+partial def handlePlainHTTP (app : Application) (sock : UInt64) (initial : ByteArray) : IO Unit := do
+  let peer ← socketGetPeerAddr sock
+  let rec loop (buffer : ByteArray) : IO Unit := do
+    match HTTP.parseHTTP1 buffer app.config.limits with
+    | .error error => sendAll sock (HTTP.encodeHTTP1 error.response "GET" true)
+    | .ok none =>
+      if buffer.size > app.config.limits.maxBodyBytes + 2 * app.config.limits.maxHeaderBytes then
+        sendAll sock (HTTP.encodeHTTP1 (HTTP.Response.text "Content Too Large" 413) "GET" true)
+      else
+        let bytes ← socketRecvBytes sock 16384
+        if !bytes.isEmpty then loop (buffer ++ bytes)
+    | .ok (some (request, rest)) =>
+      let response ← app.dispatch request { peerAddress := some peer }
+      let close := ((request.headers.get? "connection").getD "").toLower == "close"
+      sendAll sock (HTTP.encodeHTTP1 response request.method close)
+      if !close then loop rest
+  loop initial
 
 /-- Parse a simple key=value config file (ignoring comments and blank lines) -/
 def parseConfigFile (content : String) : ServerConfig := Id.run do
@@ -546,34 +599,38 @@ structure TCPConnectionPool where
   totalCreated : Nat := 0
   deriving Inhabited
 
-initialize tcpPoolRef : IO.Ref TCPConnectionPool ← IO.mkRef {}
+initialize tcpPoolMutex : Std.Mutex TCPConnectionPool ← Std.Mutex.new {}
 
 /-- Try to admit a new connection into the pool. Returns false if pool is full. -/
-def poolAdmit (sock : UInt64) (connId : Nat) : IO Bool := do
-  let pool ← tcpPoolRef.get
+def poolAdmit (sock : UInt64) (connId : Nat) : IO Bool := tcpPoolMutex.atomically do
+  let pool ← get
   if pool.entries.size >= pool.maxSize then
     return false
   let nowMs ← monoTimeMs
   let entry := { socketId := sock, connId := connId, acceptedAt := nowMs : TCPPoolEntry }
-  tcpPoolRef.set { pool with
+  set { pool with
     entries := pool.entries.push entry
     totalCreated := pool.totalCreated + 1 }
+  activeConnectionCount.set (pool.entries.size + 1)
+  activeConnectionsRef.set (pool.entries.size + 1)
   return true
 
 /-- Remove a connection from the pool when it closes -/
-def poolRelease (connId : Nat) : IO Unit := do
-  let pool ← tcpPoolRef.get
-  tcpPoolRef.set { pool with entries := pool.entries.filter (·.connId != connId) }
+def poolRelease (connId : Nat) : IO Unit := tcpPoolMutex.atomically do
+  let pool ← get
+  let entries := pool.entries.filter (·.connId != connId)
+  set { pool with entries }
+  activeConnectionCount.set entries.size
+  activeConnectionsRef.set entries.size
 
 /-- Get pool statistics -/
-def getPoolStats : IO (Nat × Nat × Nat) := do
-  let pool ← tcpPoolRef.get
+def getPoolStats : IO (Nat × Nat × Nat) := tcpPoolMutex.atomically do
+  let pool ← get
   return (pool.entries.size, pool.maxSize, pool.totalCreated)
 
 -- Initialize HTTPS server
 def initHTTPServer (port : UInt16 := 443) : IO HTTPServerState := do
-  IO.eprintln s!"✓ HTTPS Server initialized on port {port}"
-  IO.eprintln "✓ HTTP/2 and HTTP/3 over QUIC support enabled"
+  IO.eprintln s!"LeanServer initialized on port {port}"
 
   let quicServer := initQUICServer
   let h3Server := initH3Server
@@ -586,32 +643,17 @@ def initHTTPServer (port : UInt16 := 443) : IO HTTPServerState := do
   }
 
 -- Handle HTTP/3 request over QUIC
-def handleH3Request (server : HTTPServerState) (quicConnId : QUICConnectionID) (streamId : UInt64) (request : HttpRequest) : IO HTTPServerState := do
+def handleH3Request (app : Application) (server : HTTPServerState) (quicConnId : QUICConnectionID) (streamId : UInt64) (request : HttpRequest) : IO HTTPServerState := do
   IO.eprintln s!"✓ HTTP/3 request handled over QUIC stream {streamId}: {request.method} {request.path}"
 
-  -- Generate response based on path
-  let (statusCode, contentType, responseBody) := match request.path with
-  | "/" => (200, "text/plain", "Welcome to Lean HTTP/3 over QUIC Server!")
-  | "/health" => (200, "application/json", "{\"status\":\"healthy\",\"protocol\":\"h3\"}")
-  | _ => (404, "text/plain", "Page not found (HTTP/3)")
-
-  -- Build HEADERS frame using HPACK encoding (QPACK compatible for basic static headers)
-  let headerFields : Array HeaderField := #[
-    { name := ":status", value := toString statusCode },
-    { name := "content-type", value := contentType },
-    { name := "content-length", value := toString responseBody.length },
-    { name := "server", value := "LeanServer/1.0" }
-  ]
-  let encoder := initHPACKEncoder
-  let (headerBlock, _) := encodeHeaderList encoder headerFields
-  let headersFrame := createH3HeadersFrame headerBlock
-  let dataFrame := createH3DataFrame responseBody.toUTF8
-
-  -- Send HTTP/3 frames over the QUIC connection
+  let response ← app.dispatchFields .http3 (request.headers.map fun h => ⟨h.name, h.value⟩)
+    request.body ""
+  let headersFrame : H3Frame := {
+    frameType := .HEADERS
+    payload := HTTP.QPACK.encode (#[⟨":status", toString response.status⟩] ++ HTTP.responseHeaders response) }
+  let dataFrame : H3Frame := { frameType := .DATA, payload := HTTP.responseBody request.method response }
   let updatedQUICServer := sendH3FrameOverQUIC server.quicServer quicConnId streamId headersFrame
   let updatedQUICServer := sendH3FrameOverQUIC updatedQUICServer quicConnId streamId dataFrame
-
-  IO.eprintln s!"✓ HTTP/3 Response sent over QUIC: {statusCode} ({responseBody.length} bytes)"
 
   return { server with quicServer := updatedQUICServer }
 
@@ -774,49 +816,7 @@ def securityHeadersMiddleware : Middleware := {
 /-- Default middleware pipeline -/
 def defaultMiddlewares : List Middleware := [corsMiddleware, serverTimingMiddleware, securityHeadersMiddleware]
 
-/-- Global middleware registry — allows external modules to register additional
-    middleware without circular imports. Initialized with `defaultMiddlewares`.
-    Use `registerMiddleware` to add middleware from application entry points. -/
-initialize middlewareRegistry : IO.Ref (List Middleware) ← IO.mkRef defaultMiddlewares
-
-/-- Register an additional middleware to the global pipeline.
-    Call this from Main.lean or application entry points before starting the server. -/
-def registerMiddleware (mw : Middleware) : IO Unit := do
-  let current ← middlewareRegistry.get
-  middlewareRegistry.set (current ++ [mw])
-
-/-- Register multiple middleware at once. -/
-def registerMiddlewares (mws : List Middleware) : IO Unit := do
-  let current ← middlewareRegistry.get
-  middlewareRegistry.set (current ++ mws)
-
-/-- Get the current middleware pipeline. -/
-def getMiddlewares : IO (List Middleware) :=
-  middlewareRegistry.get
-
-/-- A registered route handler: method × path → IO HTTPResponse.
-    Route handlers registered here take priority over built-in routes in routeRequest. -/
-structure RouteHandler where
-  method : String          -- "GET", "POST", etc. Use "*" for any method
-  path : String            -- exact path match
-  handler : String → IO HTTPResponse  -- receives the request body
-
-/-- Global route handler registry — allows external modules to register routes
-    without circular imports. -/
-initialize routeRegistry : IO.Ref (List RouteHandler) ← IO.mkRef []
-
-/-- Register a route handler. Registered routes are checked before built-in routes. -/
-def registerRoute (method path : String) (handler : String → IO HTTPResponse) : IO Unit := do
-  let current ← routeRegistry.get
-  let route : RouteHandler := { method := method, path := path, handler := handler }
-  routeRegistry.set (current ++ [route])
-
-/-- Look up a registered route handler. Returns the first match. -/
-def findRegisteredRoute (method path : String) : IO (Option (String → IO HTTPResponse)) := do
-  let routes ← routeRegistry.get
-  match routes.find? (fun r => (r.method == method || r.method == "*") && r.path == path) with
-  | some r => return some r.handler
-  | none => return none
+-- Application dispatch is supplied explicitly through Application.handler.
 
 /-- Global shutdown handler — allows GracefulShutdown module to register its
     ShutdownCoordinator.runShutdown without circular imports. -/
@@ -841,20 +841,6 @@ def registerReloadHandler (handler : IO Unit) : IO Unit :=
 /-- Retrieve the registered reload handler, if any. -/
 def getReloadHandler : IO (Option (IO Unit)) :=
   reloadHandlerRef.get
-
-/-- Global tracing hook — allows DistributedTracing module to register its
-    span creation/injection logic without circular imports.
-    The hook receives (method, path, traceparentHeader) and returns extra
-    response headers to inject (e.g. traceparent, tracestate). -/
-initialize tracingHookRef : IO.Ref (Option (String → String → String → IO (List (String × String)))) ← IO.mkRef none
-
-/-- Register a tracing hook for distributed tracing. -/
-def registerTracingHook (hook : String → String → String → IO (List (String × String))) : IO Unit :=
-  tracingHookRef.set (some hook)
-
-/-- Retrieve the registered tracing hook, if any. -/
-def getTracingHook : IO (Option (String → String → String → IO (List (String × String)))) :=
-  tracingHookRef.get
 
 /-- Logging middleware — adds x-request-id and logs structured JSON to stdout -/
 def loggingMiddleware : Middleware := {
@@ -948,102 +934,7 @@ def logRequest (method path proto : String) (status : String) (bodyLen : Nat) (c
   let ts ← monoTimeMs
   IO.eprintln s!"\{\"ts\":{ts},\"conn\":{connId},\"ip\":\"{clientIP}\",\"method\":\"{method}\",\"path\":\"{path}\",\"proto\":\"{proto}\",\"status\":{status},\"bytes\":{bodyLen}}"
 
-/-- Unified route handler for all protocols.
-    Returns an HTTPResponse with statusCode, contentType, body, and extra headers.
-    Accepts optional request body for POST/PUT methods.
-    Checks registered route handlers first, then falls back to built-in routes.
-    Uses the global middleware registry (see `registerMiddleware`). -/
-def routeRequest (method : String) (path : String) (proto : String := "https") (body : String := "") : IO HTTPResponse := do
-  -- Check registered routes first (from external modules)
-  let registered ← findRegisteredRoute method path
-  let rawResp ← match registered with
-  | some handler => handler body
-  | none => pure <|
-    -- === GET routes ===
-    if method == "GET" && path == "/" then
-      { statusCode := "200", contentType := "text/html; charset=utf-8",
-        body :=
-       "<!DOCTYPE html><html><head><title>LeanServer</title><style>" ++
-       "body{font-family:system-ui;max-width:600px;margin:60px auto;padding:20px;" ++
-       "background:#0a0a0a;color:#e0e0e0}" ++
-       "h1{color:#7dd3fc;font-size:2em}" ++
-       ".b{background:#1e3a5f;padding:4px 10px;border-radius:12px;font-size:0.8em}" ++
-       "</style></head><body>" ++
-       "<h1>🚀 LeanServer</h1>" ++
-       "<p>Pure <b>Lean 4</b> HTTPS Server — TLS 1.3 + HTTP/2 + HTTP/3</p>" ++
-       "<p><span class='b'>QUIC v1</span> " ++
-       "<span class='b'>AES-128-GCM</span> " ++
-       "<span class='b'>X25519</span> " ++
-       "<span class='b'>RSA-PSS</span></p>" ++
-       s!"<hr><p style='color:#888'>Protocol: {proto} | Running on Arch Linux</p>" ++
-       "</body></html>" }
-    else if method == "GET" && path == "/health" then
-      { statusCode := "200", contentType := "application/json",
-        body := s!"\{\"status\":\"ok\",\"proto\":\"{proto}\",\"quic\":\"v1\"}" }
-    else if method == "GET" && path == "/info" then
-      { statusCode := "200", contentType := "application/json",
-        body := s!"\{\"server\":\"LeanServer/0.1\",\"lang\":\"Lean4\",\"proto\":\"{proto}\"," ++
-       "\"tls\":\"1.3\",\"cipher\":\"TLS_AES_128_GCM_SHA256\"," ++
-       "\"kex\":\"X25519\",\"sign\":\"RSA-PSS\"}" }
-    else if method == "GET" && path == "/styles.css" then
-      { statusCode := "200", contentType := "text/css",
-        body := "body{font-family:system-ui;max-width:600px;margin:60px auto;padding:20px;" ++
-       "background:#0a0a0a;color:#e0e0e0}" ++
-       "h1{color:#7dd3fc;font-size:2em}" }
-    -- === POST routes ===
-    else if method == "POST" && path == "/echo" then
-      { statusCode := "200", contentType := "application/json",
-        body := s!"\{\"echo\":\"" ++ body.replace "\"" "\\\"" ++ s!"\",\"len\":{body.length},\"proto\":\"{proto}\"}" }
-    else if method == "POST" && path == "/api/data" then
-      { statusCode := "201", contentType := "application/json",
-        body := s!"\{\"received\":true,\"bytes\":{body.length},\"proto\":\"{proto}\"}" }
-    -- === PUT route ===
-    else if method == "PUT" && path == "/api/data" then
-      { statusCode := "200", contentType := "application/json",
-        body := s!"\{\"updated\":true,\"bytes\":{body.length},\"proto\":\"{proto}\"}" }
-    -- === DELETE route ===
-    else if method == "DELETE" && path == "/api/data" then
-      { statusCode := "200", contentType := "application/json",
-        body := s!"\{\"deleted\":true,\"proto\":\"{proto}\"}" }
-    -- === WebSocket upgrade info ===
-    else if method == "GET" && path == "/ws" then
-      { statusCode := "200", contentType := "application/json",
-        body := s!"\{\"websocket\":true,\"proto\":\"{proto}\",\"info\":\"Send Upgrade header for WebSocket\"}" }
-    -- === Server stats ===
-    else if method == "GET" && path == "/stats" then
-      { statusCode := "200", contentType := "application/json",
-        body := s!"\{\"server\":\"LeanServer/0.2\",\"proto\":\"{proto}\",\"features\":[\"tls1.3\",\"h2\",\"h3\",\"quic\",\"websocket\",\"0-rtt\",\"session-tickets\",\"chunked\",\"cors\",\"rate-limit\"]}" }
-    -- === Chunked streaming demo ===
-    else if method == "GET" && path == "/stream" then
-      { statusCode := "200", contentType := "text/plain",
-        body := "chunk1:Hello from LeanServer!\nchunk2:Streaming via chunked encoding\nchunk3:Pure Lean 4 implementation\n",
-        extraHeaders := [("x-chunked", "true")] }  -- Marker for chunked handler
-    -- === OPTIONS (CORS preflight) ===
-    else if method == "OPTIONS" then
-      { statusCode := "204", contentType := "text/plain", body := "" }
-    -- === HEAD (same as GET but body will be stripped by caller) ===
-    else if method == "HEAD" && (path == "/" || path == "/health") then
-      { statusCode := "200", contentType := "text/plain", body := "" }
-    -- === Static file serving ===
-    else if method == "GET" && path.startsWith "/static/" then
-      { statusCode := "STATIC", contentType := "text/plain", body := path,
-        extraHeaders := [("x-static-serve", "true")] }
-    else
-      { statusCode := "404", contentType := "text/plain", body := "404 — Page Not Found" }
-  -- Apply registered middleware pipeline
-  let mws ← getMiddlewares
-  let afterMw := applyMiddleware mws method path proto body rawResp
-  -- Apply distributed tracing hook if registered (F2.6)
-  let tracingHook ← getTracingHook
-  match tracingHook with
-  | some hook =>
-    let traceparent := ""  -- caller should extract from request headers
-    let traceHeaders ← hook method path traceparent
-    let combined := afterMw.extraHeaders ++ traceHeaders
-    return { afterMw with extraHeaders := deduplicateHeaders combined }
-  | none =>
-    -- Deduplicate headers from middleware pipeline (F1.2)
-    return { afterMw with extraHeaders := deduplicateHeaders afterMw.extraHeaders }
+-- Application dispatch is supplied explicitly through Application.handler.
 
 -- ==========================================
 -- Connection Coalescing (RFC 9113 §9.1.1)
@@ -1085,6 +976,7 @@ structure H2StreamInfo where
   path : String := "/"
   headers : List (String × String) := []
   bodyChunks : Array ByteArray := #[]
+  bodySize : Nat := 0
   headersComplete : Bool := false
   deriving Inhabited
 
@@ -1163,6 +1055,11 @@ def serveStaticFile (basePath : String) (requestPath : String) : IO HTTPResponse
     catch _e =>
       return { statusCode := "404", contentType := "text/plain", body := "404 — File Not Found" }
 
+structure H2PendingResponse where
+  streamId : UInt32
+  body : ByteArray
+  offset : Nat := 0
+
 -- HTTP/2 Connection State Wrapper
 structure H2ConnectionState where
   tlsSession : TLSSessionTLS
@@ -1174,7 +1071,9 @@ structure H2ConnectionState where
   streams : List H2StreamInfo := []
   -- Flow control (RFC 7540 §6.9)
   connectionSendWindow : Int := 65535
+  initialStreamSendWindow : Int := 65535
   streamSendWindows : List (UInt32 × Int) := []
+  pendingResponses : List H2PendingResponse := []
   -- CONTINUATION frame accumulation (RFC 7540 §6.10)
   continuationStreamId : UInt32 := 0
   continuationBuffer : ByteArray := ByteArray.empty
@@ -1290,20 +1189,23 @@ def readTLSRecordToBuffer (sock : UInt64) (state : H2ConnectionState) (_ : Nat) 
 def sendH2Frame (sock : UInt64) (state : H2ConnectionState) (frame : LeanServer.HTTP2Frame) : IO H2ConnectionState := do
   let headerBytes := LeanServer.serializeFrameHeader frame.header
   let frameBytes := headerBytes ++ frame.payload
-
-  match LeanServer.encryptAppData state.tlsSession frameBytes with
-  | some (record, newSession) =>
-      let _ ← socketSend sock record record.size.toUInt32 0
-      return { state with tlsSession := newSession }
-  | none =>
-      IO.eprintln "[H2] ❌ Failed to encrypt frame"
-      return state
+  let mut session := state.tlsSession
+  let mut offset := 0
+  -- A 16 KiB DATA frame plus its nine-byte header spans two TLS records.
+  while offset < frameBytes.size do
+    let endPos := min (offset + 16384) frameBytes.size
+    let some (record, next) := LeanServer.encryptAppData session (frameBytes.extract offset endPos)
+      | throw (IO.userError "Cannot encrypt HTTP/2 frame")
+    sendAll sock record
+    session := next
+    offset := endPos
+  return { state with tlsSession := session }
 
 /-- Get the send window for a specific stream. -/
 def getStreamSendWindow (state : H2ConnectionState) (streamId : UInt32) : Int :=
   match state.streamSendWindows.find? (fun (sid, _) => sid == streamId) with
   | some (_, w) => w
-  | none => 65535  -- Default initial window per RFC 7540
+  | none => state.initialStreamSendWindow
 
 /-- Update the send window for a specific stream. -/
 def updateStreamSendWindow (state : H2ConnectionState) (streamId : UInt32) (delta : Int) : H2ConnectionState :=
@@ -1311,79 +1213,61 @@ def updateStreamSendWindow (state : H2ConnectionState) (streamId : UInt32) (delt
     if sid == streamId then (sid, w + delta) else (sid, w)
   let exists_ := state.streamSendWindows.any fun (sid, _) => sid == streamId
   let finalWindows := if exists_ then updated
-    else (streamId, 65535 + delta) :: state.streamSendWindows
+    else (streamId, state.initialStreamSendWindow + delta) :: state.streamSendWindows
   { state with streamSendWindows := finalWindows }
 
 /-- Send an HTTP/2 response (HEADERS + DATA) on a given stream.
     Respects flow control windows for DATA frames. -/
-def sendH2Response (sock : UInt64) (state : H2ConnectionState) (streamId : UInt32) (status contentType body : String) (extraHeaders : List (String × String) := []) : IO H2ConnectionState := do
-  let baseHeaders : Array (String × String) := #[
-    (":status", status),
-    ("content-type", contentType),
-    ("server", "LeanServer/0.1")
-  ]
-  -- Deduplicate headers before HPACK encoding (F1.2)
-  -- This prevents duplicate access-control-allow-origin, traceparent, vary, etc.
-  let allHeaders := (baseHeaders ++ extraHeaders.toArray).toList
-  let dedupedHeaders := deduplicateHeaders allHeaders
-  let responseHeaders := dedupedHeaders.toArray
-  -- Use stateful encoder to maintain HPACK dynamic table across the connection (RFC 7541)
-  let (headerBlock, newEncoder) := LeanServer.encodeHeadersStateful state.hpackEncoder responseHeaders
-  let state := { state with hpackEncoder := newEncoder }
+def flushH2Responses (sock : UInt64) (state : H2ConnectionState) : IO H2ConnectionState := do
+  let mut st := { state with pendingResponses := [] }
+  for pending in state.pendingResponses do
+    let mut offset := pending.offset
+    let mut complete := false
+    repeat
+      let allowed := min st.connectionSendWindow.toNat (getStreamSendWindow st pending.streamId).toNat
+      if allowed == 0 && offset < pending.body.size then break
+      let count := min 16384 (min allowed (pending.body.size - offset))
+      let last := offset + count ≥ pending.body.size
+      st ← sendH2Frame sock st (createHTTP2Frame FrameType.DATA (if last then 1 else 0) pending.streamId
+        (pending.body.extract offset (offset + count)))
+      st := updateStreamSendWindow { st with connectionSendWindow := st.connectionSendWindow - count }
+        pending.streamId (- (Int.ofNat count))
+      offset := offset + count
+      if last then
+        complete := true
+        break
+    if !complete then
+      st := { st with pendingResponses := st.pendingResponses ++ [{ pending with offset }] }
+  return st
 
-  -- RFC 7540 §6.2: Split header block across HEADERS + CONTINUATION if needed
-  -- Default SETTINGS_MAX_FRAME_SIZE is 16384 (RFC 7540 §6.5.2)
-  let maxFrameSize : Nat := 16384
+def sendH2AppResponse (sock : UInt64) (state : H2ConnectionState) (streamId : UInt32)
+    (response : HTTP.Response) (method : String := "GET") : IO H2ConnectionState := do
+  let headers := #[(":status", toString response.status)] ++
+    (HTTP.responseHeaders response).map (fun h => (HTTP.headerName h.name, h.value))
+  let (headerBlock, encoder) := LeanServer.encodeHeadersStateful state.hpackEncoder headers
+  let mut st := { state with hpackEncoder := encoder }
+  let mut offset := 0
+  repeat
+    let count := min 16384 (headerBlock.size - offset)
+    let last := offset + count ≥ headerBlock.size
+    let kind := if offset == 0 then FrameType.HEADERS else FrameType.CONTINUATION
+    st ← sendH2Frame sock st (createHTTP2Frame kind (if last then 4 else 0) streamId
+      (headerBlock.extract offset (offset + count)))
+    offset := offset + count
+    if last then break
+  flushH2Responses sock { st with pendingResponses := st.pendingResponses ++
+    [{ streamId, body := HTTP.responseBody method response }] }
 
-  let stateAfterHeaders ← if headerBlock.size ≤ maxFrameSize then
-    -- Fits in a single HEADERS frame with END_HEADERS (0x4)
-    let headersFrame := LeanServer.createHTTP2Frame LeanServer.FrameType.HEADERS 0x4 streamId headerBlock
-    sendH2Frame sock state headersFrame
-  else
-    -- Fragment: first chunk in HEADERS (no END_HEADERS), rest in CONTINUATION frames
-    let firstChunk := headerBlock.extract 0 maxFrameSize
-    -- HEADERS frame without END_HEADERS flag
-    let headersFrame := LeanServer.createHTTP2Frame LeanServer.FrameType.HEADERS 0x0 streamId firstChunk
-    let mut st ← sendH2Frame sock state headersFrame
-    let mut offset := maxFrameSize
-    -- Send CONTINUATION frames for remaining chunks
-    while offset < headerBlock.size do
-      let remaining := headerBlock.size - offset
-      let chunkSize := min remaining maxFrameSize
-      let chunk := headerBlock.extract offset (offset + chunkSize)
-      let isLast := offset + chunkSize ≥ headerBlock.size
-      -- Last CONTINUATION gets END_HEADERS (0x4)
-      let flags : UInt8 := if isLast then 0x4 else 0x0
-      let contFrame := LeanServer.createHTTP2Frame LeanServer.FrameType.CONTINUATION flags streamId chunk
-      st ← sendH2Frame sock st contFrame
-      offset := offset + chunkSize
-    IO.eprintln s!"   -> Header block split: {headerBlock.size} bytes across HEADERS + CONTINUATION frames"
-    pure st
-
-  -- DATA frame: END_STREAM (0x1) — check flow control
-  let bodyBytes := body.toUTF8
-  let connWindow := stateAfterHeaders.connectionSendWindow
-  let streamWindow := getStreamSendWindow stateAfterHeaders streamId
-  let allowedByConn := if connWindow > 0 then connWindow.toNat else 0
-  let allowedByStream := if streamWindow > 0 then streamWindow.toNat else 0
-  let allowed := min allowedByConn (min allowedByStream bodyBytes.size)
-  if allowed == 0 && bodyBytes.size > 0 then
-    IO.eprintln s!"   -> ⚠️ Flow control: window exhausted, sending empty DATA END_STREAM"
-    let dataFrame := LeanServer.createHTTP2Frame LeanServer.FrameType.DATA 0x1 streamId ByteArray.empty
-    let stateAfterData ← sendH2Frame sock stateAfterHeaders dataFrame
-    return stateAfterData
-  else
-    let sendBytes := bodyBytes.extract 0 (min allowed bodyBytes.size)
-    let dataFrame := LeanServer.createHTTP2Frame LeanServer.FrameType.DATA 0x1 streamId sendBytes
-    let stateAfterData ← sendH2Frame sock stateAfterHeaders dataFrame
-    -- Decrement flow control windows
-    let stateWithConnWin := { stateAfterData with connectionSendWindow := stateAfterData.connectionSendWindow - sendBytes.size }
-    let stateWithStreamWin := updateStreamSendWindow stateWithConnWin streamId (- sendBytes.size)
-    IO.eprintln s!"   -> ✅ Response sent ({sendBytes.size} bytes body)"
-    return stateWithStreamWin
+-- Protocol-generated errors use the same encoder.
+def sendH2Response (sock : UInt64) (state : H2ConnectionState) (streamId : UInt32)
+    (status contentType body : String) (extraHeaders : List (String × String) := []) : IO H2ConnectionState :=
+  sendH2AppResponse sock state streamId {
+    status := (status.toNat?.getD 500).toUInt16
+    headers := #[⟨"content-type", contentType⟩] ++ extraHeaders.toArray.map (fun (n,v) => ⟨n,v⟩)
+    body := body.toUTF8 }
 
 -- Handle HTTP/2 Connection Loop
-def handleH2Connection (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) (initialBuffer : ByteArray) (fuel : Nat := 100000) : IO Unit := do
+def handleH2Connection (app : Application) (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) (initialBuffer : ByteArray) (fuel : Nat := 100000) : IO Unit := do
   IO.eprintln s!"🚀 Switching to HTTP/2 Loop for connection #{connId}"
 
   -- Register origin for connection coalescing (RFC 9113 §9.1.1)
@@ -1398,6 +1282,7 @@ def handleH2Connection (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) 
   }
 
   let rec loop (state : H2ConnectionState) (fuel : Nat) : IO Unit := do
+    let state ← flushH2Responses sock state
     match fuel with
     | 0 => IO.eprintln "[H2] ⚠️ Frame processing fuel exhausted, closing connection"
     | fuel + 1 =>
@@ -1454,9 +1339,24 @@ def handleH2Connection (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) 
                          loop { state with inputBuffer := nextBuffer } fuel
                       else
                          IO.eprintln "   -> Received SETTINGS. Sending ACK."
+                         if frame.header.streamId != 0 || frame.payload.size % 6 != 0 then
+                           throw (IO.userError "Invalid HTTP/2 SETTINGS")
+                         let mut configured := state
+                         for i in [:frame.payload.size / 6] do
+                           let p := i * 6
+                           let id := frame.payload[p]!.toNat * 256 + frame.payload[p+1]!.toNat
+                           let value := frame.payload[p+2]!.toNat * 16777216 +
+                             frame.payload[p+3]!.toNat * 65536 + frame.payload[p+4]!.toNat * 256 +
+                             frame.payload[p+5]!.toNat
+                           if id == 4 then
+                             if value > 2147483647 then throw (IO.userError "Invalid HTTP/2 initial window")
+                             let delta := Int.ofNat value - configured.initialStreamSendWindow
+                             configured := { configured with
+                               initialStreamSendWindow := value
+                               streamSendWindows := configured.streamSendWindows.map fun (sid, w) => (sid, w + delta) }
                          -- Send SETTINGS ACK (Flags = 0x1, Payload empty)
                          let ackFrame := LeanServer.createHTTP2Frame LeanServer.FrameType.SETTINGS 0x1 0 ByteArray.empty
-                         let newState ← sendH2Frame sock state ackFrame
+                         let newState ← sendH2Frame sock configured ackFrame
 
                          let nextBuffer := newState.inputBuffer.extract (9 + frameLen) newState.inputBuffer.size
                          loop { newState with inputBuffer := nextBuffer } fuel
@@ -1548,46 +1448,10 @@ def handleH2Connection (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) 
 
                                    match method, path with
                                    | some m, some p =>
-                                       -- Check for gRPC content-type (RFC: application/grpc or application/grpc+proto)
-                                       let contentType := findHeader "content-type"
-                                       let isGRPC := match contentType with
-                                         | some ct => ct.startsWith "application/grpc"
-                                         | none => false
-                                       if isGRPC then do
-                                         IO.eprintln s!"   -> 🔗 gRPC request detected on stream {frame.header.streamId}: {m} {p}"
-                                         -- Build HTTP2Request for gRPC processing
-                                         let grpcH2Req : LeanServer.HTTP2Request := {
-                                           streamId := frame.header.streamId,
-                                           method := m, path := p,
-                                           headers := (headers.map fun h => (h.name, h.value)),
-                                           body := ByteArray.empty
-                                         }
-                                         let registry := LeanServer.createGRPCServiceRegistry
-                                         let grpcResp ← LeanServer.processGRPCRequest registry grpcH2Req
-                                         let grpcHeaders := grpcResp.headers.toList
-                                         let stateAfterResp ← sendH2Response sock state frame.header.streamId
-                                           (toString grpcResp.statusCode) "application/grpc+proto" ""
-                                           (grpcHeaders ++ [("grpc-status", "0"), ("grpc-message", "")])
-                                         let nextBuffer := state.inputBuffer.extract (9 + frameLen) state.inputBuffer.size
-                                         loop { stateAfterResp with hpackDecoder := newDecoder, inputBuffer := nextBuffer } fuel
-                                       else
-                                       -- Rate limiting for H2
-                                       let nowMs ← monoTimeMs
-                                       let clientIP ← try socketGetPeerAddr sock catch _e => pure "0.0.0.0"
-                                       let allowed ← checkRateLimit clientIP nowMs
-                                       let rawResp ← if !allowed then
-                                         pure (HTTPResponse.mk "429" "text/plain" "Too Many Requests" [])
-                                       else routeRequest m p "h2"
-
-                                       -- W3C Trace Context propagation (#20)
-                                       let incomingTP := findTraceparentFromFields headers
-                                       let traceCtx ← newTraceContext incomingTP
-                                       let resp := addTracingHeaders rawResp traceCtx
-
-                                       IO.eprintln s!"   -> Sending Response: {resp.statusCode} for {p}"
-
-                                       let stateAfterResp ← sendH2Response sock state frame.header.streamId resp.statusCode resp.contentType resp.body resp.extraHeaders
-
+                                       let clientIP ← socketGetPeerAddr sock
+                                       let resp ← app.dispatchFields .http2
+                                         (headers.map fun h => ⟨h.name, h.value⟩) ByteArray.empty clientIP
+                                       let stateAfterResp ← sendH2AppResponse sock state frame.header.streamId resp m
                                        let nextBuffer := state.inputBuffer.extract (9 + frameLen) state.inputBuffer.size
                                        loop { stateAfterResp with hpackDecoder := newDecoder, inputBuffer := nextBuffer } fuel
 
@@ -1665,53 +1529,36 @@ def handleH2Connection (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) 
                              loop { state with inputBuffer := nextBuffer } fuel
                          | none =>
                          -- Normal HTTP/2 DATA frame (POST/PUT body)
+                         let padded := (frame.header.flags &&& 0x8) != 0
+                         if padded && (frame.payload.isEmpty || frame.payload[0]!.toNat + 1 > frame.payload.size) then
+                           throw (IO.userError "Invalid HTTP/2 DATA padding")
+                         let bodyPart := if padded then
+                           frame.payload.extract 1 (frame.payload.size - frame.payload[0]!.toNat)
+                           else frame.payload
+                         if state.streams.any (fun s => s.streamId == sid &&
+                             s.bodySize + bodyPart.size > app.config.limits.maxBodyBytes) then
+                           throw (IO.userError "HTTP/2 request body exceeds configured limit")
                          let updatedStreams := state.streams.map fun s =>
-                           if s.streamId == sid then { s with bodyChunks := s.bodyChunks.push frame.payload }
+                           if s.streamId == sid then { s with
+                             bodyChunks := s.bodyChunks.push bodyPart
+                             bodySize := s.bodySize + bodyPart.size }
                            else s
-                         let stateWithBody := { state with streams := updatedStreams }
+                         let mut stateWithBody := { state with streams := updatedStreams }
+                         if !frame.payload.isEmpty then
+                           stateWithBody ← sendH2Frame sock stateWithBody
+                             (createWindowUpdateFrame 0 frame.payload.size.toUInt32)
+                           stateWithBody ← sendH2Frame sock stateWithBody
+                             (createWindowUpdateFrame sid frame.payload.size.toUInt32)
                          if (frame.header.flags &&& 0x1) != 0 then do
                            IO.eprintln s!"   -> DATA END_STREAM on Stream {sid} (body complete)"
                            -- Find stream info and dispatch
                            match stateWithBody.streams.find? (fun s => s.streamId == sid) with
                            | some sinfo =>
                              let fullBody := sinfo.bodyChunks.foldl (· ++ ·) ByteArray.empty
-                             let bodyStr := match String.fromUTF8? fullBody with
-                               | some s => s
-                               | none => s!"<binary:{fullBody.size}bytes>"
-                             IO.eprintln s!"   -> {sinfo.method} {sinfo.path} body={bodyStr.length} bytes"
-                             -- Check if this is a gRPC request (content-type: application/grpc*)
-                             let isGRPC := sinfo.headers.any fun (n, v) =>
-                               n == "content-type" && v.startsWith "application/grpc"
-                             if isGRPC then do
-                               IO.eprintln s!"   -> 🔗 gRPC DATA body complete on stream {sid}"
-                               let grpcH2Req : LeanServer.HTTP2Request := {
-                                 streamId := sid,
-                                 method := sinfo.method, path := sinfo.path,
-                                 headers := sinfo.headers.toArray,
-                                 body := fullBody
-                               }
-                               let registry := LeanServer.createGRPCServiceRegistry
-                               let grpcResp ← LeanServer.processGRPCRequest registry grpcH2Req
-                               let grpcExtraHeaders := grpcResp.headers.toList
-                               let stateAfterResp ← sendH2Response sock stateWithBody sid
-                                 (toString grpcResp.statusCode) "application/grpc+proto" ""
-                                 (grpcExtraHeaders ++ [("grpc-status", "0"), ("grpc-message", "")])
-                               let cleanedStreams := stateAfterResp.streams.filter (fun s => s.streamId != sid)
-                               let nextBuffer := stateWithBody.inputBuffer.extract (9 + frameLen) stateWithBody.inputBuffer.size
-                               loop { stateAfterResp with inputBuffer := nextBuffer, streams := cleanedStreams } fuel
-                             else
-                             let nowMs ← monoTimeMs
-                             let clientIP ← try socketGetPeerAddr sock catch _e => pure "0.0.0.0"
-                             let allowed ← checkRateLimit clientIP nowMs
-                             let rawResp ← if !allowed then
-                               pure (HTTPResponse.mk "429" "text/plain" "Too Many Requests" [])
-                             else routeRequest sinfo.method sinfo.path "h2" bodyStr
-                             -- W3C Trace Context propagation (#20)
-                             let incomingTP := findTraceparent sinfo.headers
-                             let traceCtx ← newTraceContext incomingTP
-                             let resp := addTracingHeaders rawResp traceCtx
-                             let stateAfterResp ← sendH2Response sock stateWithBody sid resp.statusCode resp.contentType resp.body resp.extraHeaders
-                             -- Remove stream from active list
+                             let clientIP ← socketGetPeerAddr sock
+                             let resp ← app.dispatchFields .http2
+                               (sinfo.headers.toArray.map fun (n,v) => ⟨n,v⟩) fullBody clientIP
+                             let stateAfterResp ← sendH2AppResponse sock stateWithBody sid resp sinfo.method
                              let cleanedStreams := stateAfterResp.streams.filter (fun s => s.streamId != sid)
                              let nextBuffer := stateWithBody.inputBuffer.extract (9 + frameLen) stateWithBody.inputBuffer.size
                              loop { stateAfterResp with inputBuffer := nextBuffer, streams := cleanedStreams } fuel
@@ -1730,6 +1577,7 @@ def handleH2Connection (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) 
                                             (frame.payload.get 2 (by omega)).toUInt32 <<< 8 |||
                                             (frame.payload.get 3 (by omega)).toUInt32
                            let windowInc := increment &&& 0x7FFFFFFF -- Mask reserved bit
+                           if windowInc == 0 then throw (IO.userError "Invalid HTTP/2 WINDOW_UPDATE")
                            IO.eprintln s!"   -> WINDOW_UPDATE: stream={frame.header.streamId}, increment={windowInc}"
                            let nextBuffer := state.inputBuffer.extract (9 + frameLen) state.inputBuffer.size
                            if frame.header.streamId == 0 then
@@ -1767,7 +1615,11 @@ def handleH2Connection (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) 
                          else
                            IO.eprintln s!"   -> RST_STREAM: stream={frame.header.streamId}"
                          let nextBuffer := state.inputBuffer.extract (9 + frameLen) state.inputBuffer.size
-                         loop { state with inputBuffer := nextBuffer } fuel
+                         loop { state with
+                           inputBuffer := nextBuffer
+                           streams := state.streams.filter (·.streamId != frame.header.streamId)
+                           pendingResponses := state.pendingResponses.filter (·.streamId != frame.header.streamId)
+                           streamSendWindows := state.streamSendWindows.filter (·.1 != frame.header.streamId) } fuel
                   | LeanServer.FrameType.PRIORITY =>
                          IO.eprintln s!"   -> PRIORITY frame for stream {frame.header.streamId} (advisory, ignoring)"
                          let nextBuffer := state.inputBuffer.extract (9 + frameLen) state.inputBuffer.size
@@ -1812,16 +1664,10 @@ def handleH2Connection (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) 
                                    IO.eprintln s!"   -> [Stream {sid}] Request Complete (END_STREAM from HEADERS)."
                                    match method, path with
                                    | some m, some p =>
-                                       let nowMs ← monoTimeMs
-                                       let clientIP ← try socketGetPeerAddr sock catch _e => pure "0.0.0.0"
-                                       let allowed ← checkRateLimit clientIP nowMs
-                                       let rawResp ← if !allowed then
-                                         pure (HTTPResponse.mk "429" "text/plain" "Too Many Requests" [])
-                                       else routeRequest m p "h2"
-                                       let incomingTP := findTraceparentFromFields headers
-                                       let traceCtx ← newTraceContext incomingTP
-                                       let resp := addTracingHeaders rawResp traceCtx
-                                       let stateAfterResp ← sendH2Response sock stateClean sid resp.statusCode resp.contentType resp.body resp.extraHeaders
+                                       let clientIP ← socketGetPeerAddr sock
+                                       let resp ← app.dispatchFields .http2
+                                         (headers.map fun h => ⟨h.name, h.value⟩) ByteArray.empty clientIP
+                                       let stateAfterResp ← sendH2AppResponse sock stateClean sid resp m
                                        let nextBuffer := stateClean.inputBuffer.extract (9 + frameLen) stateClean.inputBuffer.size
                                        loop { stateAfterResp with hpackDecoder := newDecoder, inputBuffer := nextBuffer } fuel
                                    | _, _ =>
@@ -2032,7 +1878,39 @@ def websocketLoop (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) (fuel
     IO.eprintln s!"   ❌ WS no app keys"
 
 -- TLS Application Data Loop
-partial def tlsApplicationLoop (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) : IO Unit := do
+/-- Encrypt bounded TLS records while preserving arbitrary application bytes. -/
+def sendTLSBytes (sock : UInt64) (session : TLSSessionTLS) (bytes : ByteArray) : IO TLSSessionTLS := do
+  let mut session := session
+  for offset in [0:bytes.size:16384] do
+    match encryptAppData session (bytes.extract offset (min (offset + 16384) bytes.size)) with
+    | none => throw (IO.userError "TLS record encryption failed")
+    | some (record, next) =>
+      sendAll sock record
+      session := next
+  return session
+
+partial def handleTLSHTTP1 (app : Application) (sock : UInt64) (session : TLSSessionTLS)
+    (buffer : ByteArray) : IO (Option (TLSSessionTLS × ByteArray)) := do
+  match HTTP.parseHTTP1 buffer app.config.limits with
+  | .error error =>
+    let _ ← sendTLSBytes sock session (HTTP.encodeHTTP1 error.response "GET" true)
+    return none
+  | .ok none =>
+    if buffer.size > app.config.limits.maxBodyBytes + 2 * app.config.limits.maxHeaderBytes then
+      let _ ← sendTLSBytes sock session (HTTP.encodeHTTP1 (HTTP.Response.text "Content Too Large" 413) "GET" true)
+      return none
+    return some (session, buffer)
+  | .ok (some (request, rest)) =>
+    let peer ← socketGetPeerAddr sock
+    let response ← app.dispatch { request with scheme := some "https" }
+      { peerAddress := some peer, secure := true }
+    let close := ((request.headers.get? "connection").getD "").toLower == "close"
+    let next ← sendTLSBytes sock session (HTTP.encodeHTTP1 response request.method close)
+    if close then return none
+    handleTLSHTTP1 app sock next rest
+
+partial def tlsApplicationLoop (app : Application) (sock : UInt64) (session : TLSSessionTLS) (connId : Nat)
+    (pending : ByteArray := ByteArray.empty) : IO Unit := do
   -- Read Record Header
   -- Read Record Header
   let headerBuf ← recvExhaustive sock 5
@@ -2062,144 +1940,11 @@ partial def tlsApplicationLoop (sock : UInt64) (session : TLSSessionTLS) (connId
                   match session.alpnProtocol with
                   | some "h2" =>
                       IO.eprintln s!"[HTTP/2] Transitioning to H2 Handler with {plaintext.size} bytes initial data"
-                      handleH2Connection sock nextReadSession connId plaintext
+                      handleH2Connection app sock nextReadSession connId plaintext
                   | _ =>
-                      -- HTTP/1.1 Logic
-                      let httpReqStr := match String.fromUTF8? plaintext with
-                        | some s => s
-                        | none => "<Binary Data>"
-                      IO.eprintln s!"📄 HTTP/1.1 Request:\n{httpReqStr.take 200}"
-
-                      -- Parse full request including body
-                      let parsedReq := parseHTTPRequest httpReqStr
-                      let (method, path, reqBody) := match parsedReq with
-                        | some req => (req.method, req.path, req.body)
-                        | none => ("GET", "/", "")
-
-                      -- Check for WebSocket Upgrade (RFC 6455)
-                      let isWSUpgrade := (httpReqStr.splitOn "Upgrade: websocket").length > 1 ||
-                                         (httpReqStr.splitOn "Upgrade: WebSocket").length > 1
-                      let hasWSKey := (httpReqStr.splitOn "Sec-WebSocket-Key:").length > 1
-
-                      if method == "GET" && isWSUpgrade && hasWSKey then do
-                        IO.eprintln "🔌 WebSocket Upgrade Request detected!"
-                        -- Extract Sec-WebSocket-Key
-                        let wsKeyParts := httpReqStr.splitOn "Sec-WebSocket-Key: "
-                        let wsKeyLine := match wsKeyParts with | _ :: s :: _ => s | _ => ""
-                        let wsKeyParts2 := wsKeyLine.splitOn "\r\n"
-                        let wsKey := match wsKeyParts2 with | s :: _ => s.trimAscii.toString | _ => ""
-                        -- Generate accept key: SHA-256(key + magic) base64-encoded
-                        -- RFC 6455 uses SHA-1, we use SHA-256 as stand-in
-                        let magicGUID := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-                        let acceptInput := wsKey ++ magicGUID
-                        let acceptHash := LeanServer.sha256 acceptInput.toUTF8
-                        let acceptB64 := LeanServer.base64Encode (acceptHash.extract 0 20)
-
-                        -- Extract optional Sec-WebSocket-Protocol
-                        let subProto := if (httpReqStr.splitOn "Sec-WebSocket-Protocol:").length > 1 then
-                          let protoParts := httpReqStr.splitOn "Sec-WebSocket-Protocol: "
-                          let protoLine := match protoParts with | _ :: s :: _ => s | _ => ""
-                          let protoParts2 := protoLine.splitOn "\r\n"
-                          match protoParts2 with | s :: _ => some s.trimAscii.toString | _ => none
-                        else none
-
-                        -- Build 101 Switching Protocols response
-                        let protoHeader := match subProto with
-                          | some p => s!"Sec-WebSocket-Protocol: {p}\r\n"
-                          | none => ""
-                        let wsResp := s!"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {acceptB64}\r\nSec-WebSocket-Version: 13\r\n{protoHeader}\r\n"
-                        let respBytes := wsResp.toUTF8
-
-                        match LeanServer.encryptAppData nextReadSession respBytes with
-                        | some (record, wsSession) =>
-                          IO.eprintln s!"   -> 🔌 Sending WebSocket Upgrade Response ({respBytes.size} bytes)"
-                          let _ ← socketSend sock record record.size.toUInt32 0
-
-                          -- Enter WebSocket frame loop
-                          IO.eprintln "   -> 🔌 WebSocket connection established! Entering WS loop..."
-                          websocketLoop sock wsSession connId
-                        | none => IO.eprintln "   -> ❌ Failed to encrypt WebSocket upgrade response"
-                      else
-
-                      -- Rate limiting check (RFC 6585 §4: 429 Too Many Requests)
-                      let nowMs ← monoTimeMs
-                      let clientIP ← try socketGetPeerAddr sock catch _e => pure "0.0.0.0"
-                      let allowed ← checkRateLimit clientIP nowMs
-                      let rawResp ← if !allowed then
-                        pure (HTTPResponse.mk "429" "text/plain" "Too Many Requests" [])
-                      else routeRequest method path "http/1.1" reqBody
-
-                      -- W3C Trace Context propagation (#20)
-                      let incomingTP := match parsedReq with
-                        | some req => findTraceparent req.headers
-                        | none => none
-                      let traceCtx ← newTraceContext incomingTP
-                      let resp := addTracingHeaders rawResp traceCtx
-
-                      -- Structured JSON log
-                      logRequest method path "http/1.1" resp.statusCode resp.body.length connId clientIP
-
-                      let bodyBytes := resp.body.toUTF8
-                      let statusLine := if resp.statusCode == "200" then "200 OK"
-                        else if resp.statusCode == "201" then "201 Created"
-                        else if resp.statusCode == "204" then "204 No Content"
-                        else if resp.statusCode == "404" then "404 Not Found"
-                        else if resp.statusCode == "429" then "429 Too Many Requests"
-                        else resp.statusCode
-                      let extraHdrs := resp.extraHeaders.foldl (fun acc (k, v) => acc ++ s!"{k}: {v}\r\n") ""
-
-                      -- Check for chunked transfer encoding marker
-                      let useChunked := resp.extraHeaders.any fun (k, _) => k == "x-chunked"
-                      if useChunked then do
-                        -- Chunked Transfer Encoding (RFC 7230 §4.1)
-                        let chunkedHdrs := extraHdrs.replace "x-chunked: true\r\n" ""
-                        let headerStr := s!"HTTP/1.1 {statusLine}\r\nContent-Type: {resp.contentType}\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n{chunkedHdrs}\r\n"
-                        let headerBytes := headerStr.toUTF8
-                        -- Send headers first
-                        match LeanServer.encryptAppData nextReadSession headerBytes with
-                        | some (hdrRecord, sessionAfterHdr) =>
-                          let _ ← socketSend sock hdrRecord hdrRecord.size.toUInt32 0
-                          -- Send body as chunks (split on newlines for demo)
-                          let chunks := resp.body.splitOn "\n" |>.filter (· != "")
-                          let mut currentSession := sessionAfterHdr
-                          for chunk in chunks do
-                            let chunkData := chunk.toUTF8
-                            let hexSize := if chunkData.size == 0 then "0" else
-                              let rec toHex (n : Nat) (acc : String) : String :=
-                                if n == 0 then (if acc.isEmpty then "0" else acc)
-                                else
-                                  let d := n % 16
-                                  let c := if d < 10 then Char.ofNat (48 + d) else Char.ofNat (87 + d)
-                                  toHex (n / 16) (String.singleton c ++ acc)
-                              toHex chunkData.size ""
-                            let chunkFrame := (hexSize ++ "\r\n" ++ chunk ++ "\r\n").toUTF8
-                            match LeanServer.encryptAppData currentSession chunkFrame with
-                            | some (cRecord, nextSess) =>
-                              let _ ← socketSend sock cRecord cRecord.size.toUInt32 0
-                              currentSession := nextSess
-                            | none => break
-                          -- Send final chunk (0\r\n\r\n)
-                          let finalChunk := "0\r\n\r\n".toUTF8
-                          match LeanServer.encryptAppData currentSession finalChunk with
-                          | some (fRecord, finalSession) =>
-                            let _ ← socketSend sock fRecord fRecord.size.toUInt32 0
-                            IO.eprintln s!"   -> 📤 Chunked response sent ({chunks.length} chunks)"
-                            tlsApplicationLoop sock finalSession connId
-                          | none => IO.eprintln "   -> ❌ Failed to encrypt final chunk"
-                        | none => IO.eprintln "   -> ❌ Failed to encrypt chunked headers"
-                      else
-
-                      let httpResp := s!"HTTP/1.1 {statusLine}\r\nContent-Type: {resp.contentType}\r\nContent-Length: {bodyBytes.size}\r\nConnection: keep-alive\r\n{extraHdrs}\r\n{resp.body}"
-                      let respBytes := String.toUTF8 httpResp
-
-                      match LeanServer.encryptAppData nextReadSession respBytes with
-                      | some (record, newSession) =>
-                         IO.eprintln s!"   -> 📤 Sending encrypted response ({respBytes.size} bytes)"
-                         let _ ← socketSend sock record record.size.toUInt32 0
-                         -- Continue Loop
-                         tlsApplicationLoop sock newSession connId
-                      | none => IO.eprintln "   -> ❌ Failed to encrypt response"
-
+                      match ← handleTLSHTTP1 app sock nextReadSession (pending ++ plaintext) with
+                      | none => pure ()
+                      | some (nextSession, rest) => tlsApplicationLoop app sock nextSession connId rest
 
                else if innerType == tlsContentAlert then
                   match parseTLSAlert plaintext with
@@ -2226,24 +1971,24 @@ partial def tlsApplicationLoop (sock : UInt64) (session : TLSSessionTLS) (connId
                           | some (record, sessionAfterKU) =>
                             let _ ← socketSend sock record record.size.toUInt32 0
                             IO.eprintln "   -> 🔑 KeyUpdate response sent, write keys rotated"
-                            tlsApplicationLoop sock sessionAfterKU connId
+                            tlsApplicationLoop app sock sessionAfterKU connId pending
                           | none =>
                             IO.eprintln "   -> ⚠️ Failed to encrypt KeyUpdate response"
-                            tlsApplicationLoop sock updatedSession connId
+                            tlsApplicationLoop app sock updatedSession connId pending
                         else
-                          tlsApplicationLoop sock updatedSession connId
+                          tlsApplicationLoop app sock updatedSession connId pending
                       | none =>
                         IO.eprintln "   -> ⚠️ KeyUpdate processing failed"
-                        tlsApplicationLoop sock nextReadSession connId
+                        tlsApplicationLoop app sock nextReadSession connId pending
                     else
                       IO.eprintln s!"   -> Post-handshake message type 0x{(plaintext.get 0 (by omega)).toNat} (ignored)"
-                      tlsApplicationLoop sock nextReadSession connId
+                      tlsApplicationLoop app sock nextReadSession connId pending
                   else
                     IO.eprintln s!"   -> Post-handshake message type 0x0 (ignored, empty)"
-                    tlsApplicationLoop sock nextReadSession connId
+                    tlsApplicationLoop app sock nextReadSession connId pending
                else
                   IO.eprintln s!"   -> Unexpected innerType=0x{innerType.toNat} in AppLoop"
-                  tlsApplicationLoop sock nextReadSession connId
+                  tlsApplicationLoop app sock nextReadSession connId pending
 
            | none => IO.eprintln "❌ Decryption Failed (AppLoop)"
         | none => IO.eprintln "❌ No App Keys in AppLoop"
@@ -2258,10 +2003,10 @@ partial def tlsApplicationLoop (sock : UInt64) (session : TLSSessionTLS) (connId
          return
       else
          IO.eprintln s!"   ⚠️ Unexpected content type 0x{contentType.toNat} (AppLoop)"
-         tlsApplicationLoop sock session connId
+         tlsApplicationLoop app sock session connId pending
 
 -- TLS Handshake Loop (Waiting for Finished)
-def tlsHandshakeLoop (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) (fuel : Nat := 100) : IO Unit :=
+def tlsHandshakeLoop (app : Application) (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) (fuel : Nat := 100) : IO Unit :=
   match fuel with
   | 0 => IO.eprintln "[TLS] ⚠️ Handshake fuel exhausted, aborting"
   | fuel + 1 => do
@@ -2285,7 +2030,7 @@ def tlsHandshakeLoop (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) (f
          -- Validate CCS through pure step function (CCS is a no-op in TLS 1.3)
          let _ccsResult := TLS.ServerStep.serverHandshakeStep
            (sessionToServerState session) .changeCipherSpec
-         tlsHandshakeLoop sock session connId fuel
+         tlsHandshakeLoop app sock session connId fuel
 
       else if contentType == tlsContentAppData then -- Encrypted Handshake Message
          match session.handshakeKeys with
@@ -2360,14 +2105,14 @@ def tlsHandshakeLoop (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) (f
                           IO.eprintln "   -> ⚠️ No resumption secret, skipping session ticket"
                           pure appSession
 
-                      tlsApplicationLoop sock sessionAfterTicket connId
+                      tlsApplicationLoop app sock sessionAfterTicket connId
                   | none => IO.eprintln "   -> ❌ Failed to transition to AppData"
                 else
                   IO.eprintln s!"   -> Unexpected msg type in HSLoop (not Finished)"
-                  tlsHandshakeLoop sock nextReadSession connId fuel
+                  tlsHandshakeLoop app sock nextReadSession connId fuel
                else
                   IO.eprintln s!"   -> Unexpected innerType {innerType} or empty plaintext in HSLoop"
-                  tlsHandshakeLoop sock nextReadSession connId fuel
+                  tlsHandshakeLoop app sock nextReadSession connId fuel
             | none => IO.eprintln "❌ Decryption Failed (HSLoop)"
          | none => IO.eprintln "❌ No Handshake Keys in HSLoop"
 
@@ -2379,67 +2124,31 @@ def tlsHandshakeLoop (sock : UInt64) (session : TLSSessionTLS) (connId : Nat) (f
          return
       else
          IO.eprintln s!"   ⚠️ Unexpected content type 0x{contentType.toNat} (HSLoop)"
-         tlsHandshakeLoop sock session connId fuel
+         tlsHandshakeLoop app sock session connId fuel
 
 -- Entry point for TLS Connection
--- Phase 6.1: Uses try/finally to guarantee connection counter decrement on ALL paths
--- (including exceptions from tlsHandshakeLoop).
-def handleTLSConnection (sock : UInt64) (initialSession : TLSSessionTLS) (connId : Nat) : IO Unit := do
+-- Connection accounting is owned by the accept loop for every protocol.
+def handleTLSConnection (app : Application) (sock : UInt64) (initialSession : TLSSessionTLS) (connId : Nat) : IO Unit := do
   IO.eprintln s!"🔄 Enter TLS Loop for connection #{connId}"
-  let _ ← incrementConnections
-  try
-    tlsHandshakeLoop sock initialSession connId
-  finally
-    let remaining ← decrementConnections
-    let _ ← socketClose sock
-    IO.eprintln s!"🔌 Connection #{connId} closed. (Active: {remaining})"
+  tlsHandshakeLoop app sock initialSession connId
 
 -- Handle REAL client connection with actual network I/O
-def handleRealConnection (clientSock : UInt64) (_ : HTTPServerState) (connId : Nat) : IO Unit := do
-  -- Set socket timeout for receive operations (30 seconds)
-  -- Note: We would need to implement setsockopt in C for timeout, for now we rely on client behavior
-
-  -- Create buffer for receiving data
-  let bufSize : UInt32 := 4096
-  let buf := ByteArray.mk (List.replicate bufSize.toNat (0 : UInt8)).toArray
-
-  -- Receive HTTP/TLS request with error handling
-  let recvRes ← socketRecv clientSock buf bufSize 0
-
-  if recvRes > 0 then
-    -- Extract received data
-    let receivedData := buf.extract 0 recvRes.toNat
-    IO.eprintln s!"📩 Received {recvRes} bytes from connection #{connId}"
-
-    -- Basic request validation (minimum 5 bytes for TLS record header)
-    if h5 : receivedData.size < 5 then
-      IO.eprintln s!"⚠️ Request too short from connection #{connId}"
-      sendErrorResponse clientSock 400 "Bad Request"
-      let _ ← socketClose clientSock
-      return
-    else
-
-    -- Check if it's an HTTP request (starts with method)
-    let firstFour := receivedData.extract 0 (min 4 receivedData.size)
-    if isValidHttpRequest firstFour then
-      -- Send HTTP/1.1 response
-      let response := "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 25\r\n\r\nHello from REAL LeanServer!"
-      let responseBytes := String.toUTF8 response
-      let sendRes ← socketSend clientSock responseBytes responseBytes.size.toUInt32 0
-      IO.eprintln s!"📤 Sent {sendRes} bytes HTTP/1.1 response to connection #{connId}"
-      let _ ← socketClose clientSock
-    else if isHttp2Preface receivedData then
-      -- HTTP/2 connection attempt
-      IO.eprintln s!"🚀 HTTP/2 connection attempt from connection #{connId}"
-      sendHttp2Preface clientSock
-      let _ ← socketClose clientSock
-    else if receivedData.get 0 (by omega) == tlsContentHandshake then
-      -- TLS Handshake (ClientHello starts with 0x16)
-      IO.eprintln s!"🔐 TLS Handshake detected from connection #{connId}"
-
-      -- Load certificate and key
-      let _ ← loadCertificateDER "cert.pem"
-      let _ ← loadPrivateKey "key.pem"
+def handleRealConnection (app : Application) (clientSock : UInt64) (_ : HTTPServerState) (connId : Nat) : IO Unit := do
+  setSocketTimeout clientSock app.config.requestTimeoutMs
+  let initial ← recvExhaustive clientSock 5
+  if initial.isEmpty then return
+  if initial.size < 5 then
+    sendAll clientSock (HTTP.encodeHTTP1 (HTTP.Response.text "Bad Request" 400) "GET" true)
+    return
+  if initial[0]! != tlsContentHandshake then
+    if app.config.enableHTTP1 then handlePlainHTTP app clientSock initial
+    else sendAll clientSock (HTTP.encodeHTTP1 (HTTP.Response.text "HTTPS Required" 400) "GET" true)
+  else if app.config.enableTLS then
+      let recordLen := initial[3]!.toNat * 256 + initial[4]!.toNat
+      if recordLen > maxTLSRecordSize then return
+      let recordBody ← recvExhaustive clientSock recordLen
+      if recordBody.size != recordLen then return
+      let receivedData := initial ++ recordBody
 
       -- ALPN Negotiate
       let clientHello := LeanServer.parseClientHello receivedData
@@ -2447,7 +2156,7 @@ def handleRealConnection (clientSock : UInt64) (_ : HTTPServerState) (connId : N
         | some ch =>
             match ch.alpnProtocols with
             | some protos =>
-                if protos.contains "h2" then some "h2"
+                if app.config.enableHTTP2 && protos.contains "h2" then some "h2"
                 else if protos.contains "http/1.1" then some "http/1.1"
                 else none
             | none => none
@@ -2494,7 +2203,7 @@ def handleRealConnection (clientSock : UInt64) (_ : HTTPServerState) (connId : N
                   let ccsMsg := LeanServer.buildChangeCipherSpec
                   let _ ← socketSend clientSock ccsMsg ccsMsg.size.toUInt32 0
                   -- Build transcript
-                  let chRecordLen := ((receivedData.get 3 (by omega)).toNat * 256) + (receivedData.get 4 (by omega)).toNat
+                  let chRecordLen := ((receivedData[3]!).toNat * 256) + (receivedData[4]!).toNat
                   let extractLen := if 5 + chRecordLen <= receivedData.size then chRecordLen else (receivedData.size - 5)
                   let clientHelloMsg := receivedData.extract 5 (5 + extractLen)
                   let transcript := clientHelloMsg ++ serverHelloMsg
@@ -2520,7 +2229,7 @@ def handleRealConnection (clientSock : UInt64) (_ : HTTPServerState) (connId : N
                     let (flight2, newSession) ← LeanServer.buildFlight2PSK session keys
                     IO.eprintln s!"   -> 🛡️ PSK Flight 2 (EE + Finished) [{flight2.size} bytes]"
                     let _ ← socketSend clientSock flight2 flight2.size.toUInt32 0
-                    handleTLSConnection clientSock newSession connId
+                    handleTLSConnection app clientSock newSession connId
                     pure true
                   | none =>
                     IO.eprintln "   -> ⚠️ PSK but no key_share, falling back to full handshake"
@@ -2574,34 +2283,22 @@ def handleRealConnection (clientSock : UInt64) (_ : HTTPServerState) (connId : N
               pure #[]
 
             -- 4. Build & Encrypt Flight 2 (Extensions, Cert Chain, CV, Finished)
-            let (flight2, newSession) ← LeanServer.buildFlight2 session keys none chainCerts
+            let (flight2, newSession) ← LeanServer.buildFlight2 session keys none chainCerts app.config.certPath app.config.keyPath
 
             IO.eprintln s!"   -> 🛡️ Sending Flight 2 (Encrypted Extensions + Cert + CV + Finished) [{flight2.size} bytes]..."
             let _ ← socketSend clientSock flight2 flight2.size.toUInt32 0
 
             -- 4. Enter TLS record loop (Waiting for Client Finished, then Application Data)
-            handleTLSConnection clientSock newSession connId
+            handleTLSConnection app clientSock newSession connId
 
           | none =>
             IO.eprintln "   -> ❌ Fatal: No Client Key Share, cannot proceed."
-            let _ ← socketClose clientSock
+            pure ()
 
       | none =>
           IO.eprintln "   -> TLS Session Init Failed (Parse Error)"
-          let _ ← socketClose clientSock
+          pure ()
 
-    else
-      -- Assume it's unknown protocol
-      IO.eprintln s!"⚠️ Unknown protocol from connection #{connId}"
-      sendErrorResponse clientSock 426 "Upgrade Required"
-      let _ ← socketClose clientSock
-  else if recvRes == 0 then
-    IO.eprintln s!"🔌 Client closed connection #{connId} gracefully"
-    let _ ← socketClose clientSock
-  else
-    IO.eprintln s!"⚠️ Receive error {recvRes} for connection #{connId}"
-    sendErrorResponse clientSock 500 "Internal Server Error"
-    let _ ← socketClose clientSock
 
 -- ==========================================
 -- QUIC / HTTP/3 over UDP
@@ -3113,7 +2810,7 @@ def buildACKFrame (largestPN : UInt64) : ByteArray :=
   encodeVarInt 0 ++          -- ACK Range Count (0 = only one range)
   encodeVarInt largestPN      -- First ACK Range (= Largest - Smallest, here all PNs from 0..largest)
 
-def handleQUICLongHeader (udpSock : UInt64) (data : ByteArray) (clientIP : String) (clientPort : UInt32) : IO Unit := do
+def handleQUICLongHeader (app : Application) (udpSock : UInt64) (data : ByteArray) (clientIP : String) (clientPort : UInt32) : IO Unit := do
   IO.eprintln s!"🔷 QUIC: Received Long Header packet ({data.size} bytes) from {clientIP}:{clientPort}"
 
   match parseQUICLongHeader data with
@@ -3294,7 +2991,7 @@ def handleQUICLongHeader (udpSock : UInt64) (data : ByteArray) (clientIP : Strin
                             alpnProtocol := selectedProtocol
                           }
 
-                          let (flight2Msg, sessionWithFullTranscript) ← LeanServer.buildFlight2Messages session keys (some quicParams)
+                          let (flight2Msg, sessionWithFullTranscript) ← LeanServer.buildFlight2Messages session keys (some quicParams) #[] app.config.certPath app.config.keyPath
 
                           -- CRITICAL: sessionWithFullTranscript has transcript = CH + SH + EE + Cert + CV + SF
                           -- The original 'session' only has CH + SH — using it for app key derivation
@@ -4279,11 +3976,11 @@ def sendH3ControlStreams (sock : UInt64) (clientIP : String) (clientPort : UInt3
 /-- Process a complete HTTP/3 request on a bidi stream.
     Parses QPACK headers, extracts DATA body, routes, builds and sends H3 response.
     Returns true if a response was sent. -/
-def processH3Request (udpSock : UInt64) (clientIP : String) (clientPort : UInt32)
+def processH3Request (app : Application) (udpSock : UInt64) (clientIP : String) (clientPort : UInt32)
     (dcidHex : String) (dcidLen : Nat) (data : ByteArray)
     (streamId : UInt64) (fullStreamData : ByteArray) (hasFin : Bool)
     (appKeys : LeanServer.ApplicationKeys)
-    (dynTable : Array (String × String) := #[]) : IO Bool := do
+    (_dynTable : Array (String × String) := #[]) : IO Bool := do
   -- Try to parse as HTTP/3 frame
   match decodeVarInt fullStreamData 0 with
   | some (h3FrameType, ftPos) =>
@@ -4295,161 +3992,30 @@ def processH3Request (udpSock : UInt64) (clientIP : String) (clientPort : UInt32
         IO.eprintln s!"      QPACK Header Block: {h3Len} bytes"
         IO.eprintln s!"      Raw: {LeanServer.hex (headerBlock.extract 0 (min 30 headerBlock.size))}..."
 
-        -- Extract basic request info from QPACK (robust parsing)
-        let mut reqPath := "/"
-        let mut reqMethod := "GET"
-
-        if headerBlock.size >= 2 then
-          let mut qpos := 2
-          while h_qpos : qpos < headerBlock.size do
-            let qbyte := headerBlock.get qpos h_qpos
-            -- 1. Indexed Field Line: 1TNNNNNN
-            if qbyte &&& 0x80 != 0 then
-              let isStatic := (qbyte &&& 0x40) != 0
-              let idx := (qbyte &&& 0x3F).toNat
-              if isStatic then
-                if idx == 17 then reqMethod := "GET"
-                else if idx == 18 then reqMethod := "HEAD"
-                else if idx == 20 then reqMethod := "POST"
-                else if idx == 15 then reqMethod := "CONNECT"
-                else if idx == 16 then reqMethod := "DELETE"
-                else if idx == 19 then reqMethod := "OPTIONS"
-                else if idx == 21 then reqMethod := "PUT"
-                else if idx == 1 then reqPath := "/"
-                IO.eprintln s!"         QPACK: Indexed static[{idx}]"
-              else
-                -- Dynamic table lookup
-                match qpackDynamicTableLookup dynTable idx with
-                | some (dname, dvalue) =>
-                  IO.eprintln s!"         QPACK: Indexed dynamic[{idx}] = ({dname}, {dvalue})"
-                  if dname == ":path" then reqPath := dvalue
-                  else if dname == ":method" then reqMethod := dvalue
-                | none =>
-                  IO.eprintln s!"         QPACK: Indexed dynamic[{idx}] (not found)"
-              qpos := qpos + 1
-            -- 2. Literal with Name Reference: 01NTTTTT
-            else if qbyte &&& 0xC0 == 0x40 then
-              let isStatic := (qbyte &&& 0x10) != 0
-              let nameIdx := (qbyte &&& 0x0F).toNat
-              qpos := qpos + 1
-              if h_qp : qpos < headerBlock.size then
-                let vFirstByte := headerBlock.get qpos h_qp
-                let isHuffman := (vFirstByte &&& 0x80) != 0
-                let vlen := (vFirstByte &&& 0x7F).toNat
-                qpos := qpos + 1
-                if qpos + vlen <= headerBlock.size then
-                  let vdata := headerBlock.extract qpos (qpos + vlen)
-                  let decodedValue : Option String :=
-                    if isHuffman then
-                      match hpackHuffmanDecode vdata with
-                      | some decoded =>
-                        match String.fromUTF8? decoded with
-                        | some s => some s
-                        | none => none
-                      | none => none
-                    else
-                      String.fromUTF8? vdata
-                  match decodedValue with
-                  | some s =>
-                    IO.eprintln s!"         QPACK: LitNameRef {if isStatic then "S" else "D"}[{nameIdx}] = \"{s}\"{if isHuffman then " (Huffman)" else ""}"
-                    if isStatic && nameIdx == 1 then reqPath := s
-                    else if isStatic && nameIdx == 0 then
-                      IO.eprintln s!"         (authority: {s})"
-                  | none =>
-                    IO.eprintln s!"         QPACK: LitNameRef value decode failed ({vlen} bytes)"
-                  qpos := qpos + vlen
-                else qpos := headerBlock.size
-              else qpos := headerBlock.size
-            -- 3. Literal with Literal Name: 001NHHHH (0x20-0x3F)
-            else if qbyte &&& 0xE0 == 0x20 then
-              let nlen := (qbyte &&& 0x07).toNat
-              qpos := qpos + 1
-              if qpos + nlen <= headerBlock.size then
-                let _ndata := headerBlock.extract qpos (qpos + nlen)
-                qpos := qpos + nlen
-                if h_qp2 : qpos < headerBlock.size then
-                  let vlen := (headerBlock.get qpos h_qp2 &&& 0x7F).toNat
-                  qpos := qpos + 1
-                  qpos := qpos + vlen
-                else qpos := headerBlock.size
-              else qpos := headerBlock.size
-            -- 4. Indexed with Post-Base
-            else if qbyte &&& 0xF0 == 0x10 then
-              IO.eprintln s!"         QPACK: Post-base indexed"
-              qpos := qpos + 1
-            -- 5. Literal with Post-Base Name Ref
-            else
-              IO.eprintln s!"         QPACK: Post-base literal"
-              qpos := qpos + 1
-
-        IO.eprintln s!"      📋 Request: {reqMethod} {reqPath}"
-
-        -- Check for HTTP/3 DATA frames after HEADERS (POST/PUT body)
-        let h3BodyEnd := headerStart + h3Len.toNat
-        let mut h3Body := ""
-        if h3BodyEnd < fullStreamData.size then
-          match decodeVarInt fullStreamData h3BodyEnd with
-          | some (nextFrameType, nftPos) =>
-            if nextFrameType == 0x00 then -- DATA frame
-              match decodeVarInt fullStreamData nftPos with
-              | some (dataLen2, dataStart) =>
-                let dataEnd := dataStart + dataLen2.toNat
-                if dataEnd <= fullStreamData.size then
-                  let bodyData := fullStreamData.extract dataStart dataEnd
-                  h3Body := match String.fromUTF8? bodyData with
-                    | some s => s
-                    | none => s!"<binary:{bodyData.size}bytes>"
-                  IO.eprintln s!"      📦 H3 DATA body: {h3Body.length} bytes"
-              | none => pure ()
-          | none => pure ()
-
-        -- Route the request using unified handler
-        let rawResp ← routeRequest reqMethod reqPath "h3" h3Body
-        -- W3C Trace Context (#20) — generate new trace for HTTP/3
-        let traceCtx ← newTraceContext none
-        let resp := addTracingHeaders rawResp traceCtx
-        IO.eprintln s!"      📤 Responding: {resp.statusCode} ({resp.body.length} bytes)"
-
-        -- HTTP/3 Server Push with cache management (#15)
-        -- RFC 9114 §4.6: Only push if client sent MAX_PUSH_ID, push ID is within
-        -- budget, and the path has not been pushed already on this connection.
-        if reqPath == "/" && resp.contentType == "text/html; charset=utf-8" then do
-          let connForPush ← getQUICState dcidHex
-          let pushPath := "/style.css"
-          let pushAllowed := match connForPush.h3MaxPushId with
-            | some maxId => connForPush.h3NextPushId ≤ maxId &&
-                            !(connForPush.h3PushedPaths.contains pushPath)
-            | none => false  -- Client hasn't sent MAX_PUSH_ID → no push
-          if pushAllowed then
-            IO.eprintln s!"      📎 Server Push: {pushPath} (pushId={connForPush.h3NextPushId})"
-            let pushPN := connForPush.serverWritePN
-            let pushId := connForPush.h3NextPushId
-            -- Server-initiated uni streams: 3, 7, 11, 15, ... → 4*n + 3
-            let pushStreamId := pushId * 4 + 3
-            let dcidForPush := match connForPush.peerConnectionId with
-              | some peerCid => peerCid.data
-              | none => data.extract 1 (1 + dcidLen)
-            let _ ← sendH3ServerPush udpSock clientIP clientPort dcidForPush appKeys
-              streamId pushId pushStreamId pushPN
-              pushPath "text/css" "body { font-family: sans-serif; }"
-            updateQUICState dcidHex { connForPush with
-              serverWritePN := pushPN + 2
-              h3NextPushId := pushId + 1
-              h3PushedPaths := connForPush.h3PushedPaths.push pushPath }
-          else if connForPush.h3PushedPaths.contains pushPath then
-            IO.eprintln s!"      ℹ️ Server Push skipped: {pushPath} already pushed"
-          else
-            IO.eprintln s!"      ℹ️ Server Push skipped: MAX_PUSH_ID not set by client"
-          pure ()
-
-        -- Build HTTP/3 response (with QPACK dynamic table #13)
-        let connForQpack ← getQUICState dcidHex
-        let (qpackBlock, updatedDynTable) := encodeQPACKSimple resp.statusCode resp.contentType resp.body.length
-          (dynTable := connForQpack.qpackDynamicTable)
-        updateQUICState dcidHex { connForQpack with qpackDynamicTable := updatedDynTable }
-        let h3HeadersFrame := encodeH3Frame { frameType := H3FrameType.HEADERS, payload := qpackBlock }
-        let bodyBytes := resp.body.toUTF8
-        let h3DataFrame := encodeH3Frame { frameType := H3FrameType.DATA, payload := bodyBytes }
+        if !hasFin || headerStart + h3Len.toNat > fullStreamData.size then return false
+        let some headers := HTTP.QPACK.decode headerBlock app.config.limits | do
+          IO.eprintln "Invalid or unsupported QPACK field section"
+          return false
+        let reqMethod := (headers.get? ":method").getD ""
+        let mut pos := headerStart + h3Len.toNat
+        let mut body := ByteArray.empty
+        while pos < fullStreamData.size do
+          let some (kind, next) := decodeVarInt fullStreamData pos | return false
+          let some (length, start) := decodeVarInt fullStreamData next | return false
+          if start + length.toNat > fullStreamData.size then return false
+          if kind == 0 then body := body ++ fullStreamData.extract start (start + length.toNat)
+          else if kind == 1 then
+            let some trailers := HTTP.QPACK.decode (fullStreamData.extract start (start + length.toNat))
+              app.config.limits | return false
+            if trailers.any (fun h => h.name.startsWith ":") then return false
+          pos := start + length.toNat
+          if body.size > app.config.limits.maxBodyBytes then return false
+        let resp ← app.dispatchFields .http3 headers body clientIP
+        let qpackBlock := HTTP.QPACK.encode
+          (#[⟨":status", toString resp.status⟩] ++ HTTP.responseHeaders resp)
+        let h3HeadersFrame := encodeH3Frame { frameType := .HEADERS, payload := qpackBlock }
+        let bodyBytes := HTTP.responseBody reqMethod resp
+        let h3DataFrame := encodeH3Frame { frameType := .DATA, payload := bodyBytes }
         let h3ResponsePayload := h3HeadersFrame ++ h3DataFrame
 
         -- Build ACK frame
@@ -4567,7 +4133,7 @@ def processH3Request (udpSock : UInt64) (clientIP : String) (clientPort : UInt32
     pure false
 
 
-def handleQUICShortHeader (udpSock : UInt64) (data : ByteArray) (clientIP : String) (clientPort : UInt32) : IO Unit := do
+def handleQUICShortHeader (app : Application) (udpSock : UInt64) (data : ByteArray) (clientIP : String) (clientPort : UInt32) : IO Unit := do
   if data.size < 2 then return
 
   -- Short Header: 1st byte | DCID (variable) | PN (variable) | Encrypted Payload
@@ -5011,7 +4577,7 @@ def handleQUICShortHeader (udpSock : UInt64) (data : ByteArray) (clientIP : Stri
                         | none => streamData
                       IO.eprintln s!"   🔄 Stream {streamId} complete ({fullStreamData.size} bytes)"
                       let connDyn ← getQUICState dcidHex
-                      let sent ← processH3Request udpSock clientIP clientPort dcidHex dcidLen data streamId fullStreamData hasFin appKeys connDyn.qpackDynamicTable
+                      let sent ← processH3Request app udpSock clientIP clientPort dcidHex dcidLen data streamId fullStreamData hasFin appKeys connDyn.qpackDynamicTable
                       if sent then responseSentInLoop := true
                     else
                       IO.eprintln s!"   ⏳ Stream {streamId}: buffering ({streamData.size} bytes), waiting for FIN..."
@@ -5321,9 +4887,10 @@ def quicRetransmitSweep (udpSock : UInt64) : IO Unit := do
 
 
 /-- Main QUIC/UDP listener loop. Runs concurrently with the TCP listener. -/
-partial def quicUdpLoop (udpSock : UInt64) : IO Unit := do
+partial def quicUdpLoop (app : Application) (udpSock : UInt64) : IO Unit := do
   IO.eprintln "🔷 QUIC UDP listener started on port 4433"
   let rec loop : IO Unit := do
+    if ← shutdownRequested then return
     let buf := ByteArray.mk (List.replicate 4096 0).toArray
     try
       let (bytesRead, clientIP, clientPort) ← socketRecvFrom udpSock buf 4096
@@ -5364,11 +4931,11 @@ partial def quicUdpLoop (udpSock : UInt64) : IO Unit := do
                       | none => pure remaining.size
             let pktEndClamped := min pktEnd remaining.size
             let currentPkt := remaining.extract 0 pktEndClamped
-            handleQUICLongHeader udpSock currentPkt clientIP clientPort
+            handleQUICLongHeader app udpSock currentPkt clientIP clientPort
             remaining := remaining.extract pktEndClamped remaining.size
           else if remaining.get 0 (by omega) &&& 0x40 != 0 then
             -- Short Header: no length field, consumes rest of datagram
-            handleQUICShortHeader udpSock remaining clientIP clientPort
+            handleQUICShortHeader app udpSock remaining clientIP clientPort
             remaining := ByteArray.empty
           else
             IO.eprintln s!"🔷 QUIC: Non-QUIC data ({remaining.size} bytes) from {clientIP}:{clientPort}"
@@ -5385,174 +4952,83 @@ partial def quicUdpLoop (udpSock : UInt64) : IO Unit := do
       loop
   loop
 
-def runHTTPServer (server : HTTPServerState) : IO Unit := do
-  serverLog .INFO "Server" s!"🚀 Starting REAL HTTPS Server on port {server.port}"
-  serverLog .INFO "Server" "✅ Supports HTTP/2 and HTTP/3 over QUIC with actual network I/O"
-  serverLog .INFO "Server" "Press Ctrl+C to stop..."
-
-  -- Install signal handlers for graceful shutdown (SIGINT/SIGTERM)
+/-- Run the existing TCP/TLS and QUIC engines with one explicit application. -/
+def runHTTPServer (app : Application) (server : HTTPServerState) : IO Unit := do
   installSignalHandlers
-  serverLog .INFO "Server" "✅ Signal handlers installed (SIGINT/SIGTERM → graceful shutdown)"
-
-  -- Configure connection pool from config (#14)
-  let cfg ← getServerConfig
-  let pool ← tcpPoolRef.get
-  tcpPoolRef.set { pool with maxSize := cfg.maxConnections }
-  serverLog .DEBUG "Server" s!"✅ Connection pool configured (max={cfg.maxConnections})"
-
-  -- Initialize Winsock for REAL network operations
-  wsInit
-
-  -- Create REAL socket
+  serverConfigRef.set app.config
+  tcpPoolMutex.atomically (set ({ maxSize := app.config.maxConnections } : TCPConnectionPool))
   let serverSock ← socketCreate 0
-  serverLog .DEBUG "Server" s!"✅ Socket created: {serverSock}"
-
-  -- Bind to REAL port
   try
-    let _ ← socketBind serverSock server.port.toUInt32
-    serverLog .INFO "Server" s!"✅ Bound to port {server.port}"
-  catch e =>
-    serverLog .ERROR "Server" s!"❌ Failed to bind to port {server.port}: {e}"
-    return
-
-  -- Listen for REAL connections
-  try
-    let _ ← socketListen serverSock 10
-    serverLog .INFO "Server" s!"✅ Listening on port {server.port}..."
-  catch e =>
-    serverLog .ERROR "Server" s!"❌ Failed to listen: {e}"
-    return
-
-  -- Set accept timeout so we can check for shutdown signals (fallback for non-epoll)
-  setSocketTimeout serverSock 1000  -- 1 second timeout
-
-  -- Set server socket to non-blocking and create epoll instance
-  setNonBlocking serverSock
-  let epfd ← epollCreate
-  epollAdd epfd serverSock EPOLLIN
-  serverLog .INFO "Server" "✅ epoll event loop initialized (non-blocking accept)"
-
-  serverLog .INFO "Server" "⏳ Waiting for REAL client connections..."
-
-  -- Create UDP socket for QUIC/HTTP3
-  try
-    let udpSock ← socketCreate 1  -- proto_type=1 → SOCK_DGRAM/UDP
-    serverLog .DEBUG "QUIC" s!"✅ UDP socket created: {udpSock}"
-    socketBind udpSock server.port.toUInt32
-    serverLog .INFO "QUIC" s!"✅ UDP socket bound to port {server.port}"
-    -- Set 50ms receive timeout so the loop can run retransmission sweeps
-    setSocketTimeout udpSock 50
-    serverLog .DEBUG "QUIC" "✅ UDP socket SO_RCVTIMEO set to 50ms"
-    -- Launch QUIC listener as background task
-    let _ ← IO.asTask (quicUdpLoop udpSock)
-    serverLog .INFO "QUIC" "✅ QUIC/UDP listener launched (background task)"
-  catch e =>
-    serverLog .WARN "QUIC" s!"⚠️ Failed to start QUIC/UDP listener: {e}"
-    serverLog .WARN "QUIC" "   (HTTP/3 will be unavailable, TCP/HTTPS still active)"
-
-  -- Prune PSK cache periodically
-  let _ ← IO.asTask do
-    let prunePSKLoop : IO Unit := do
-      while true do
-        IO.sleep 60000  -- Every 60s
-        let nowMs ← monoTimeMs
-        let cache ← pskCacheRef.get
-        pskCacheRef.set (cache.prune nowMs)
-    prunePSKLoop
-
-  -- Accept TCP connections loop with REAL I/O
-  let mut currentServer := server
-  let mut connCount := 0
-  let mut isShuttingDown := false
-
-  while !isShuttingDown do
+    socketBindAddress serverSock app.config.host server.port.toUInt32
+    socketListen serverSock 128
+    setNonBlocking serverSock
+    let epfd ← epollCreate
     try
-      let shouldStop ← shutdownRequested
-      if shouldStop then
-        serverLog .WARN "Server" "🛑 Shutdown signal received!"
-        isShuttingDown := true
-
-        -- Use registered shutdown handler (ShutdownCoordinator) if available,
-        -- otherwise fall back to inline drain logic.
-        let handler ← getShutdownHandler
-        match handler with
-        | some runShutdown => runShutdown
-        | none =>
-          -- Inline fallback: drain with 30s timeout
-          serverLog .WARN "Server" "  (no ShutdownCoordinator registered — using inline drain)"
-
-          -- Mark all active QUIC connections as draining
-          let quicConns ← quicConnections.get
-          for (cidHex, conn) in quicConns.toList do
-            if conn.state == QUICConnectionState.connected then
-              IO.eprintln s!"   🔄 Draining QUIC connection {cidHex}"
-              let nowMs ← monoTimeMs
-              updateQUICState cidHex { conn with
-                state := QUICConnectionState.draining
-                drainingStartMs := nowMs
-                h3GoAwaySent := true
-                h3GoAwayStreamId := 0
-              }
-
-          -- Wait for active connections to finish (with timeout)
-          let mut drainWait := 0
-          let mut activeConns ← activeConnectionsRef.get
-          while activeConns > 0 && drainWait < 30 do  -- 30 second drain timeout
-            IO.eprintln s!"   ⏳ Waiting for {activeConns} active connection(s) to finish..."
-            IO.sleep 1000
-            drainWait := drainWait + 1
-            activeConns ← activeConnectionsRef.get
-          if activeConns > 0 then
-            IO.eprintln s!"   ⚠️ Drain timeout: {activeConns} connection(s) still active"
-          else
-            IO.eprintln "   ✅ All connections drained"
-      else
-        -- Check for SIGHUP → config hot-reload (F2.5)
-        let shouldReload ← reloadRequested
-        if shouldReload then
-          let handler ← getReloadHandler
-          match handler with
-          | some doReload => doReload
-          | none => serverLog .WARN "Server" "⚠️ SIGHUP received but no reload handler registered"
-
-        -- Use epoll to wait for accept readiness (100ms timeout for signal checks)
-        let events ← epollWait epfd 64 100
-        for (fd, _mask) in events do
-          if fd == serverSock then
-            -- Server socket ready — accept all pending connections
-            let mut moreClients := true
-            while moreClients do
-              let maybeClient ← acceptNonBlocking serverSock
-              match maybeClient with
-              | none => moreClients := false
-              | some clientSock =>
-                connCount := connCount + 1
-                let admitted ← poolAdmit clientSock connCount
-                if !admitted then
-                  serverLog .WARN "Server" s!"⚠️ Connection #{connCount} rejected — pool full"
-                  let _ ← socketClose clientSock
-                else
-                  serverLog .INFO "Server" s!"✨ Connection #{connCount} accepted! (Socket: {clientSock})"
-                  let connIdCopy := connCount
-                  let _ ← IO.asTask (do
-                    try
-                      handleRealConnection clientSock currentServer connIdCopy
-                    catch e =>
-                      serverLog .ERROR "Server" s!"❌ Connection #{connIdCopy} handler error: {e}"
+      epollAdd epfd serverSock EPOLLIN
+      let udpSock ← if app.config.enableHTTP3 then do
+        let sock ← socketCreate 1
+        try
+          socketBindAddress sock app.config.host (app.config.udpPort.getD server.port).toUInt32
+          setSocketTimeout sock 50
+          pure (some sock)
+        catch e =>
+          socketClose sock
+          throw e
+      else pure none
+      let udpTask ← udpSock.mapM fun sock => IO.asTask (quicUdpLoop app sock)
+      let mut tasks : Array (Task (Except IO.Error Unit)) := #[]
+      try
+        IO.eprintln s!"LeanServer listening on {app.config.host}:{server.port}"
+        let mut connId := 0
+        while !(← shutdownRequested) do
+          let events ← epollWait epfd 64 100
+          for (fd, _) in events do
+            if fd == serverSock then
+              let mut accepting := true
+              while accepting do
+                match ← acceptNonBlocking serverSock with
+                | none => accepting := false
+                | some sock =>
+                  connId := connId + 1
+                  if !(← poolAdmit sock connId) then socketClose sock
+                  else
+                    let id := connId
+                    let task ← IO.asTask do
                       try
-                        let _ ← socketClose clientSock
-                      catch _e => pure ()
-                    poolRelease connIdCopy)
+                        handleRealConnection app sock server id
+                      catch e => IO.eprintln s!"Connection {id}: {e}"
+                      finally
+                        socketClose sock
+                        poolRelease id
+                    tasks := tasks.push task
+          tasks ← tasks.filterM fun task => return !(← IO.hasFinished task)
+          if ← reloadRequested then
+            if let some reload ← getReloadHandler then reload
+        if let some shutdown ← getShutdownHandler then shutdown
+      finally
+        for task in tasks do
+          let _ ← IO.ofExcept (← IO.wait task)
+        if let some task := udpTask then
+          let _ ← IO.ofExcept (← IO.wait task)
+        if let some sock := udpSock then socketClose sock
+    finally socketClose epfd
+  finally socketClose serverSock
 
-    catch _e =>
-      -- epoll error or signal interruption — check shutdown flag and continue
-      pure ()
+/-- Interpret effects once per request; the interpreter may be called concurrently. -/
+def serve [Monad m] (config : ServerConfig)
+    (runEffect : ∀ {α : Type}, m α → IO α) (handler : HTTP.Handler m) : IO Unit := do
+  if config.enableHTTP2 && !config.enableTLS then
+    throw (IO.userError "HTTP/2 requires enableTLS")
+  if !(config.enableHTTP1 || config.enableTLS || config.enableHTTP3) then
+    throw (IO.userError "Enable at least one protocol")
+  if config.enableTLS || config.enableHTTP3 then
+    if (← loadCertificateDER config.certPath).isNone || (← loadPrivateKey config.keyPath).isNone then
+      throw (IO.userError "Cannot load TLS certificate or private key")
+  let state ← initHTTPServer config.port
+  runHTTPServer { handler := fun ctx => runEffect (handler ctx), config } state
 
-  -- Cleanup
-  let _ ← socketClose serverSock
-  let _ ← socketClose epfd  -- Close the epoll fd
-  wsCleanup
-  serverLog .INFO "Server" "👋 HTTPS Server stopped gracefully"
+def serveIO (config : ServerConfig) (handler : HTTP.Handler IO) : IO Unit :=
+  serve config (fun action => action) handler
 
 -- ============================================================================
 -- §H. HTTPServer Property Proofs (Phase 9.1)

@@ -1,12 +1,9 @@
--- Sample Web Application with Database Integration
--- Demonstrates full-stack web development with LeanServer
--- REST API for user management with PostgreSQL/MySQL backend
-
 import LeanServer.Web.WebApplicationSimple
+import Lean.Data.Json
 
+/-! A pure routing/SQL-preview example. It does not connect to a database. -/
 namespace LeanServer
 
--- User Entity Structure
 structure User where
   id : Option Nat := none
   name : String
@@ -14,102 +11,48 @@ structure User where
   age : Nat
   created_at : Option String := none
 
--- Convert User to JSON
 def userToJson (user : User) : String :=
-  let idStr := match user.id with
-  | some id => toString id
-  | none => "null"
+  (Lean.Json.mkObj [("id", Lean.toJson user.id), ("name", Lean.toJson user.name),
+    ("email", Lean.toJson user.email), ("age", Lean.toJson user.age),
+    ("created_at", Lean.toJson user.created_at)]).compress
 
-  let createdStr := match user.created_at with
-  | some ts => "\"" ++ ts ++ "\""
-  | none => "null"
+private def preview (sql : String) : HTTP.Response :=
+  HTTP.Response.json (Lean.Json.mkObj [("sql", Lean.toJson sql)]).compress
 
-  "{{\"id\": " ++ idStr ++ ", \"name\": \"" ++ user.name ++ "\", \"email\": \"" ++ user.email ++ "\", \"age\": " ++ toString user.age ++ ", \"created_at\": " ++ createdStr ++ "}}"
+def createUserTableHandler [Monad m] : HTTP.Handler m := fun _ =>
+  pure (preview "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT, email TEXT, age INT)")
+def getUsersHandler [Monad m] : HTTP.Handler m := fun _ =>
+  pure (preview "SELECT id, name, email, age FROM users ORDER BY id")
 
--- Database Schema Creation
-def createUserTableHandler (request : HttpRequest) : IO ResponseBuilder := do
-  IO.eprintln s!"[SampleWebApp] POST /setup from {request.method}"
-  return jsonResponse "{\"status\": \"ok\", \"message\": \"CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT, email TEXT, age INT, created_at TIMESTAMP DEFAULT NOW())\"}"
+private def withUserId [Monad m] (sql : Nat → String) : HTTP.Handler m := fun ctx =>
+  match (ctx.paramOr "id" "").toNat? with
+  | some id => pure (preview (sql id))
+  | none => pure (HTTP.Response.text "Invalid user id" 400)
 
--- GET /users - List all users
-def getUsersHandler (_ : HttpRequest) : IO ResponseBuilder := do
-  return jsonResponse "{\"status\": \"ok\", \"sql\": \"SELECT id, name, email, age, created_at FROM users ORDER BY id\"}"
+def getUserByIdHandler [Monad m] : HTTP.Handler m :=
+  withUserId (fun id => s!"SELECT * FROM users WHERE id = {id}")
+def updateUserHandler [Monad m] : HTTP.Handler m :=
+  withUserId (fun id => s!"UPDATE users SET ... WHERE id = {id}")
+def deleteUserHandler [Monad m] : HTTP.Handler m :=
+  withUserId (fun id => s!"DELETE FROM users WHERE id = {id}")
+def createUserHandler [Monad m] : HTTP.Handler m := fun ctx =>
+  pure (HTTP.Response.json (Lean.Json.mkObj [
+    ("sql", Lean.toJson "INSERT INTO users (name, email, age) VALUES (...)"),
+    ("body", Lean.toJson (String.fromUTF8! ctx.request.body))]).compress)
+def healthCheckHandler [Monad m] : HTTP.Handler m := fun _ =>
+  pure (HTTP.Response.json "{\"status\":\"healthy\"}")
+def rootHandler [Monad m] : HTTP.Handler m := fun _ =>
+  pure (HTTP.Response.html "<h1>LeanServer SQL preview</h1><p>This demo returns SQL without executing it.</p><p>GET /users, GET /users/:id, POST /users, PUT /users/:id, DELETE /users/:id, POST /setup, GET /health</p>")
 
--- GET /users/:id - Get user by ID
-def getUserByIdHandler (request : HttpRequest) : IO ResponseBuilder := do
-  -- Extract ID from path (e.g., "/users/42")
-  let parts := request.path.splitOn "/"
-  let idStr := parts.getD 2 "0"
-  return jsonResponse s!"\{\"status\": \"ok\", \"sql\": \"SELECT * FROM users WHERE id = {idStr}\"}"
-
--- POST /users - Create new user
-def createUserHandler (request : HttpRequest) : IO ResponseBuilder := do
-  -- In a real app, parse JSON body for name/email/age
-  let bodyStr := String.fromUTF8! request.body
-  return jsonResponse s!"\{\"status\": \"ok\", \"sql\": \"INSERT INTO users (name, email, age) VALUES (...)\", \"body\": \"{bodyStr}\"}"
-
--- PUT /users/:id - Update user
-def updateUserHandler (request : HttpRequest) : IO ResponseBuilder := do
-  let parts := request.path.splitOn "/"
-  let idStr := parts.getD 2 "0"
-  return jsonResponse s!"\{\"status\": \"ok\", \"sql\": \"UPDATE users SET ... WHERE id = {idStr}\"}"
-
--- DELETE /users/:id - Delete user
-def deleteUserHandler (request : HttpRequest) : IO ResponseBuilder := do
-  let parts := request.path.splitOn "/"
-  let idStr := parts.getD 2 "0"
-  return jsonResponse s!"\{\"status\": \"ok\", \"sql\": \"DELETE FROM users WHERE id = {idStr}\"}"
-
--- Health check route
-def healthCheckHandler (_request : HttpRequest) : IO ResponseBuilder :=
-  return jsonResponse "{\"status\": \"healthy\", \"database\": \"framework-ready\"}"
-
--- Root route
-def rootHandler (_request : HttpRequest) : IO ResponseBuilder :=
-  let html := "
-  <!DOCTYPE html>
-  <html>
-  <head><title>LeanServer Demo</title></head>
-  <body>
-    <h1>🚀 LeanServer Full-Stack Demo</h1>
-    <p>Welcome to the LeanServer web application with database integration!</p>
-    <h2>Available Endpoints:</h2>
-    <ul>
-      <li><code>POST /setup</code> - Create users table</li>
-      <li><code>GET /users</code> - List all users</li>
-      <li><code>GET /users/:id</code> - Get user by ID</li>
-      <li><code>POST /users</code> - Create new user</li>
-      <li><code>PUT /users/:id</code> - Update user</li>
-      <li><code>DELETE /users/:id</code> - Delete user</li>
-      <li><code>GET /health</code> - Health check</li>
-    </ul>
-    <p><strong>Database:</strong> PostgreSQL | <strong>Language:</strong> Lean 4 | <strong>Type Safety:</strong> Compile-time verified</p>
-  </body>
-  </html>"
-  return htmlResponse html
-
--- Initialize Sample Web Application
-def createSampleWebApp : IO WebApplication := do
-  let mut app ← initWebApplication
-
-  -- Add routes
-  app := addRoute app "POST" "/setup" createUserTableHandler
-  app := addRoute app "GET" "/users" getUsersHandler
-  app := addRoute app "GET" "/users/" getUserByIdHandler
-  app := addRoute app "POST" "/users" createUserHandler
-  app := addRoute app "PUT" "/users/" updateUserHandler
-  app := addRoute app "DELETE" "/users/" deleteUserHandler
-  app := addRoute app "GET" "/health" healthCheckHandler
-  app := addRoute app "GET" "/" rootHandler
-
-  return app
-
--- Main function for the sample application
-def main : IO Unit := do
-  IO.eprintln "🎯 LeanServer Full-Stack Web Application Demo"
-  IO.eprintln "Building enterprise web apps with type-safe database operations"
-
-  let app ← createSampleWebApp
-  startWebApplication app
+def createSampleWebApp [Monad m] : WebApplication m :=
+  ({} : HTTP.Router m)
+    |>.post "/setup" createUserTableHandler
+    |>.get "/users" getUsersHandler
+    |>.get "/users/:id" getUserByIdHandler
+    |>.post "/users" createUserHandler
+    |>.put "/users/:id" updateUserHandler
+    |>.delete "/users/:id" deleteUserHandler
+    |>.get "/health" healthCheckHandler
+    |>.get "/" rootHandler
 
 end LeanServer

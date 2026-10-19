@@ -14,12 +14,12 @@ import Init.System.IO
 # Integration Test (ROADMAP F2.7)
 
 Validates that all F2 module integrations work correctly:
-- F2.1: Middleware pipeline (register & apply)
-- F2.2: Health endpoints (route registry)
-- F2.3: Metrics endpoint (route registry)
+- F2.1: Middleware pipeline (explicit list & apply)
+- F2.2: Health endpoints (explicit router)
+- F2.3: Metrics endpoint (explicit router)
 - F2.4: Graceful shutdown handler (registry)
 - F2.5: Config hot-reload handler (registry)
-- F2.6: Distributed tracing hook (registry)
+- F2.6: Explicit distributed tracing middleware
 -/
 
 open LeanServer
@@ -58,43 +58,44 @@ def main : IO Unit := do
   let mut total := 0
   let mut pass := 0
 
+  -- Concurrent admission/release must preserve the same counts observed by probes.
+  let admissions ← (List.range 32).mapM fun i => IO.asTask (poolAdmit 0 (10000 + i))
+  for task in admissions do
+    if !(← IO.ofExcept (← IO.wait task)) then throw (IO.userError "Unexpected pool admission failure")
+  let (active, _, _) ← getPoolStats
+  let observed ← getActiveThreadCount
+  if active != 32 || observed != 32 then throw (IO.userError "Connection count lost during concurrent admission")
+  let releases ← (List.range 32).mapM fun i => IO.asTask (poolRelease (10000 + i))
+  for task in releases do IO.ofExcept (← IO.wait task)
+  let (remaining, _, _) ← getPoolStats
+  if remaining != 0 then throw (IO.userError "Connection count leaked after release")
+  passed "Concurrent pool admission, probe counts, release"
+
   -- ==========================================
   -- F2.1: Middleware Pipeline
   -- ==========================================
   IO.println "── F2.1: Middleware Pipeline ──"
 
-  -- Test: register and retrieve middleware
+  let mws : List (HTTP.Middleware IO) := [
+    RequestId.requestIdMiddleware {}, advancedCORSMiddleware {},
+    contentNegotiationMiddleware, compressionMiddleware {} ]
   total := total + 1
-  registerMiddlewares [
-    RequestId.requestIdMiddleware {},
-    advancedCORSMiddleware {},
-    contentNegotiationMiddleware,
-    compressionMiddleware {}
-  ]
-  let mws ← getMiddlewares
-  let ok ← assert "Register 4 middleware" (mws.length ≥ 4)
-    s!"expected ≥4 middleware, got {mws.length}"
+  let ok ← assert "Explicit middleware pipeline" (mws.length == 4)
   if ok then pass := pass + 1
 
-  -- Test: middleware names are correct
+  let ctx := HTTP.Context.ofRequest { headers := #[⟨"x-request-id", "incoming-id"⟩,
+    ⟨"origin", "https://example.com"⟩] }
+  let handler : HTTP.Handler IO := fun ctx =>
+    pure (HTTP.Response.text ((ctx.local "request-id").getD "missing"))
+  let applied ← HTTP.Middleware.all mws handler ctx
   total := total + 1
-  let names := mws.map (·.name)
-  let hasRequestId := names.any (· == "request-id")
-  let hasCors := names.any (· == "cors")
-  let ok ← assert "Middleware names present" (hasRequestId && hasCors)
-    s!"names: {names}"
+  let ok ← assert "Request ID available inside handler and response"
+    (applied.body == "incoming-id".toUTF8 && applied.headers.get? "x-request-id" == some "incoming-id")
   if ok then pass := pass + 1
-
-  -- Test: apply middleware to response
   total := total + 1
-  let testResp : LeanServer.HTTPResponse := { statusCode := "200", contentType := "text/plain", body := "hello" }
-  let applied := applyMiddleware mws "GET" "/" "HTTP/1.1" "" testResp
-  let hasHeaders := applied.extraHeaders.length > 0
-  let ok ← assert "Middleware transforms response" hasHeaders
-    "no extra headers after middleware"
+  let ok ← assert "Canonical middleware adds CORS and Vary"
+    (applied.headers.get? "access-control-allow-origin" == some "*" && (applied.headers.get? "vary").isSome)
   if ok then pass := pass + 1
-
-  IO.println ""
 
   -- ==========================================
   -- F2.2: Health Endpoints
@@ -103,28 +104,28 @@ def main : IO Unit := do
 
   -- Test: register health route
   total := total + 1
-  registerRoute "GET" "/health/deep" fun _ => do
+  let router : HTTP.Router IO := ({} : HTTP.Router IO).get "/health/deep" fun _ => do
     let report ← deepHealthCheck "cert.pem" "key.pem"
     pure (healthCheckResponse report)
-  let found ← findRegisteredRoute "GET" "/health/deep"
+  let found := (HTTP.selectRoute "GET" "/health/deep" router.routes).map (·.1.handler)
   let ok ← assert "Register /health/deep route" found.isSome
   if ok then pass := pass + 1
 
   -- Test: register readiness route
   total := total + 1
-  registerRoute "GET" "/ready" fun _ => do
+  let router := router.get "/ready" fun _ => do
     let report ← readinessCheck
     pure (healthCheckResponse report)
-  let found ← findRegisteredRoute "GET" "/ready"
+  let found := (HTTP.selectRoute "GET" "/ready" router.routes).map (·.1.handler)
   let ok ← assert "Register /ready route" found.isSome
   if ok then pass := pass + 1
 
   -- Test: register liveness route
   total := total + 1
-  registerRoute "GET" "/livez" fun _ => do
+  let router := router.get "/livez" fun _ => do
     let report ← livenessCheck
     pure (healthCheckResponse report)
-  let found ← findRegisteredRoute "GET" "/livez"
+  let found := (HTTP.selectRoute "GET" "/livez" router.routes).map (·.1.handler)
   let ok ← assert "Register /livez route" found.isSome
   if ok then pass := pass + 1
 
@@ -132,10 +133,10 @@ def main : IO Unit := do
   total := total + 1
   match found with
   | some handler =>
-    let resp ← handler ""
-    let isJson := resp.contentType.startsWith "application/json"
+    let resp ← handler (HTTP.Context.ofRequest {})
+    let isJson := ((resp.headers.get? "content-type").getD "").startsWith "application/json"
     let ok ← assert "Health response is JSON" isJson
-      s!"contentType={resp.contentType}"
+      s!"contentType={((resp.headers.get? "content-type").getD "")}"
     if ok then pass := pass + 1
   | none =>
     failed "Health response is JSON" "no handler found"
@@ -149,10 +150,10 @@ def main : IO Unit := do
 
   -- Test: register metrics route
   total := total + 1
-  registerRoute "GET" "/metrics" fun _ => do
+  let router := router.get "/metrics" fun _ => do
     let body ← generatePrometheusMetrics
-    return { statusCode := "200", contentType := "text/plain; version=0.0.4; charset=utf-8", body := body }
-  let found ← findRegisteredRoute "GET" "/metrics"
+    return (HTTP.Response.text body).withHeader "content-type" "text/plain; version=0.0.4; charset=utf-8"
+  let found := (HTTP.selectRoute "GET" "/metrics" router.routes).map (·.1.handler)
   let ok ← assert "Register /metrics route" found.isSome
   if ok then pass := pass + 1
 
@@ -160,10 +161,10 @@ def main : IO Unit := do
   total := total + 1
   match found with
   | some handler =>
-    let resp ← handler ""
-    let hasHelp := contains resp.body "# HELP" || contains resp.body "leanserver"
+    let resp ← handler (HTTP.Context.ofRequest {})
+    let hasHelp := contains (String.fromUTF8! resp.body) "# HELP" || contains (String.fromUTF8! resp.body) "leanserver"
     let ok ← assert "Metrics response is Prometheus format" hasHelp
-      s!"body length={resp.body.length}"
+      s!"body length={resp.body.size}"
     if ok then pass := pass + 1
   | none =>
     failed "Metrics response is Prometheus format" "no handler found"
@@ -242,47 +243,37 @@ def main : IO Unit := do
   -- ==========================================
   IO.println "── F2.6: Distributed Tracing ──"
 
-  -- Test: register tracing hook
+  let observed ← IO.mkRef ""
+  let traced ← tracingMiddleware (fun ctx => do
+    observed.set ((ctx.local "traceparent").getD "")
+    pure (HTTP.Response.text "traced")) (HTTP.Context.ofRequest {})
   total := total + 1
-  registerTracingHook fun method path traceparent => do
-    let span ← startSpanFromTraceparent
-      (if traceparent.isEmpty then "00-0000000000000000-0000000000000000-00" else traceparent)
-      s!"{method} {path}" .server
-    let finished ← finishSpan span .ok
-    return injectTraceparent finished
-  let hook ← getTracingHook
-  let ok ← assert "Register tracing hook" hook.isSome
+  let ok ← assert "Tracing spans actual handler"
+    ((← observed.get) == (traced.headers.get? "traceparent").getD "" && !(← observed.get).isEmpty)
+  if ok then pass := pass + 1
+  total := total + 1
+  let ok ← assert "Traceparent has four fields"
+    ((((traced.headers.get? "traceparent").getD "").splitOn "-").length == 4)
+  if ok then pass := pass + 1
+  total := total + 1
+  let ok ← assert "Span is collected after handler" (!(← drainSpans).isEmpty)
   if ok then pass := pass + 1
 
-  -- Test: invoke tracing hook and check headers
-  total := total + 1
-  match hook with
-  | some h =>
-    let headers ← h "GET" "/" ""
-    let hasTraceparent := headers.any (fun (k, _) => k == "traceparent")
-    let ok ← assert "Tracing hook produces traceparent header" hasTraceparent
-      s!"headers: {headers.map (·.1)}"
-    if ok then pass := pass + 1
-  | none =>
-    failed "Tracing hook produces traceparent header" "no hook"
-
-  -- Test: traceparent header format (00-{32hex}-{16hex}-{2hex})
-  total := total + 1
-  match hook with
-  | some h =>
-    let headers ← h "POST" "/api/data" ""
-    match headers.find? (fun (k, _) => k == "traceparent") with
-    | some (_, val) =>
-      let parts := val.splitOn "-"
-      let ok ← assert "traceparent has 4 parts" (parts.length == 4)
-        s!"parts={parts.length}: {val}"
-      if ok then pass := pass + 1
-    | none =>
-      failed "traceparent has 4 parts" "no traceparent header"
-  | none =>
-    failed "traceparent has 4 parts" "no hook"
-
-  IO.println ""
+  let tracingTasks ← (List.range 32).mapM fun _ => IO.asTask do
+    tracingMiddleware (fun _ => pure (HTTP.Response.text "ok")) (HTTP.Context.ofRequest {})
+  for task in tracingTasks do
+    let _ ← IO.ofExcept (← IO.wait task)
+  let collected ← drainSpans
+  if collected.length != 32 then
+    throw (IO.userError s!"Lost spans during concurrent collection: expected 32, got {collected.length}")
+  let failedAsExpected ← try
+    let _ ← tracingMiddleware (fun _ => throw (IO.userError "traced failure")) (HTTP.Context.ofRequest {})
+    pure false
+  catch _ => pure true
+  let failureSpans ← drainSpans
+  if !failedAsExpected || !(failureSpans.any (fun span => span.status == .error_)) then
+    throw (IO.userError "Tracing swallowed exception or lost error span")
+  passed "Concurrent tracing and exception recording"
 
   -- ==========================================
   -- Route lookup: non-existent route returns none
@@ -290,12 +281,12 @@ def main : IO Unit := do
   IO.println "── Negative Tests ──"
 
   total := total + 1
-  let notFound ← findRegisteredRoute "DELETE" "/nonexistent"
+  let notFound := HTTP.selectRoute "DELETE" "/nonexistent" router.routes
   let ok ← assert "Non-existent route returns none" notFound.isNone
   if ok then pass := pass + 1
 
   total := total + 1
-  let wrongMethod ← findRegisteredRoute "POST" "/health/deep"
+  let wrongMethod := HTTP.selectRoute "POST" "/health/deep" router.routes
   let ok ← assert "Wrong method returns none" wrongMethod.isNone
   if ok then pass := pass + 1
 
@@ -310,3 +301,4 @@ def main : IO Unit := do
   else
     IO.println s!"❌ {pass}/{total} integration tests passed ({total - pass} failed)"
     IO.eprintln s!"FAIL: {total - pass} test(s) failed"
+    throw (IO.userError s!"{total - pass} integration tests failed")

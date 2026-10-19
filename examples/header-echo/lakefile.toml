@@ -1,0 +1,15 @@
+name = "header-echo"
+version = "0.1.0"
+defaultTargets = ["header-echo"]
+
+[[require]]
+name = "LeanServer"
+path = "../.."
+
+[[lean_lib]]
+name = "HeaderEchoProof"
+roots = ["App", "Proof"]
+
+[[lean_exe]]
+name = "header-echo"
+root = "Main"

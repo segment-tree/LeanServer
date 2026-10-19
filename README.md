@@ -1,5 +1,9 @@
 # LeanServer — Servidor HTTPS Verificado em Lean 4
 
+Application API development: see [the runnable Network.c-only example and
+migration status](docs/APPLICATION_API.md), including current protocol and
+verification limits. Build with `lake build header_echo`; no `make` is required.
+
 Um servidor HTTPS completo implementado em **Lean 4**, com TLS 1.3, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, e **935 teoremas formais** verificados pelo compilador — zero `sorry`. A especificação formal É o código executável: sem extracção, sem spec-impl gap.
 
 ## Números do Projeto

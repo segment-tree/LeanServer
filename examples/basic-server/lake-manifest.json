@@ -3,10 +3,10 @@
  "packages":
  [{"type": "path",
    "scope": "",
-   "name": "leanserver",
+   "name": "LeanServer",
    "manifestFile": "lake-manifest.json",
    "inherited": false,
    "dir": "../..",
-   "configFile": "lakefile.toml"}],
+   "configFile": "lakefile.lean"}],
  "name": "«basic-server»",
  "lakeDir": ".lake"}

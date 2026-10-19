@@ -1,0 +1,33 @@
+name: Application framework
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  network-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lean
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Pure application API without native sources
+        run: |
+          lake build LeanServerPure framework_tests webapptests
+          .lake/build/bin/framework_tests
+          .lake/build/bin/webapptests
+          test ! -d .lake/build/native
+      - name: Network-only runtime (no make)
+        run: |
+          lake build header_echo framework_server webserver test_integration
+          .lake/build/bin/test_integration
+          test ! -e .lake/build/lib/libLeanServerOptional.a
+          python3 tests/framework_e2e.py --tls --skip-http3
+      - name: Independent Lake consumer
+        run: |
+          lake -d examples/header-echo build
+          lake -d examples/basic-server build
+          python3 tests/web_e2e.py

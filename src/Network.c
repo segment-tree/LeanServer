@@ -114,6 +114,29 @@ LEAN_EXPORT lean_obj_res lean_bind(uint64_t s, uint32_t port, lean_object* _moni
     return lean_io_result_mk_ok(lean_box(0));
 }
 
+// Explicit bind address for library callers; preserve the old wildcard wrapper.
+LEAN_EXPORT lean_obj_res lean_bind_address(uint64_t s, b_lean_obj_arg host,
+                                           uint32_t port, lean_object* _monitor) {
+    struct sockaddr_in6 addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons((uint16_t)port);
+    const char *ip = lean_string_cstr(host);
+    if (strcmp(ip, "0.0.0.0") == 0 || strcmp(ip, "::") == 0) {
+        addr.sin6_addr = in6addr_any;
+    } else if (inet_pton(AF_INET6, ip, &addr.sin6_addr) != 1) {
+        struct in_addr v4;
+        if (inet_pton(AF_INET, ip, &v4) != 1)
+            return lean_io_error_from_errno("Invalid bind address");
+        addr.sin6_addr.s6_addr[10] = 0xff;
+        addr.sin6_addr.s6_addr[11] = 0xff;
+        memcpy(&addr.sin6_addr.s6_addr[12], &v4, 4);
+    }
+    if (bind((int)s, (struct sockaddr*)&addr, sizeof(addr)) < 0)
+        return lean_io_error_from_errno(strerror(errno));
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
 LEAN_EXPORT lean_obj_res lean_listen(uint64_t s, int32_t backlog, lean_object* _monitor) {
     if (listen((int)s, (int)backlog) < 0) {
         return lean_io_error_from_errno(strerror(errno));
@@ -156,6 +179,21 @@ LEAN_EXPORT lean_obj_res lean_set_socket_timeout(uint64_t s, uint32_t timeout_ms
 // ==========================================
 // Data Transfer
 // ==========================================
+
+// Return a freshly owned byte array. Never mutate a borrowed Lean ByteArray.
+LEAN_EXPORT lean_obj_res lean_socket_recv_bytes(uint64_t s, uint32_t limit,
+                                                lean_object* _monitor) {
+    lean_object *bytes = lean_alloc_sarray(1, limit, limit);
+    ssize_t count;
+    do { count = recv((int)s, lean_sarray_cptr(bytes), limit, 0); }
+    while (count < 0 && errno == EINTR && !g_shutdown_requested);
+    if (count < 0) {
+        lean_dec(bytes);
+        return lean_io_error_from_errno(strerror(errno));
+    }
+    lean_to_sarray(bytes)->m_size = (size_t)count;
+    return lean_io_result_mk_ok(bytes);
+}
 
 LEAN_EXPORT lean_obj_res lean_recv(uint64_t s, lean_object* buf, uint32_t len, uint32_t flags, lean_object* _monitor) {
     uint8_t* rawBuf = lean_sarray_cptr(buf);

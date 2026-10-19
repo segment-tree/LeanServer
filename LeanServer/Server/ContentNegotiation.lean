@@ -1,4 +1,4 @@
-import LeanServer.Server.HTTPServer
+import LeanServer.HTTP.Middleware
 
 /-!
 # Content Negotiation (R26)
@@ -231,14 +231,16 @@ def negotiateContent (headers : List (String × String))
     encoding := negotiateEncoding acceptEnc supportedEncodings
     language := negotiateLanguage acceptLang supportedLanguages }
 
-/-- Content negotiation middleware -/
-def contentNegotiationMiddleware : Middleware := {
-  name := "content-negotiation"
-  apply := fun _ _ _ _ resp =>
-    -- Add Vary header to indicate content negotiation
-    { resp with extraHeaders := resp.extraHeaders ++
-      [("vary", "Accept, Accept-Encoding, Accept-Language")] }
-}
+/-- Validate the representation produced by the handler against Accept.
+    Applications can use negotiateContentType before producing a representation. -/
+def contentNegotiationMiddleware [Monad m] : HTTP.Middleware m := fun next ctx => do
+  let response ← next ctx
+  let response := response.vary "Accept"
+  let some offered := response.headers.get? "content-type" | return response
+  let accept := (ctx.request.headers.get? "accept").getD "*/*"
+  if response.status < 300 && (negotiateContentType accept [offered]).isNone then
+    return (HTTP.Response.text "Not Acceptable" 406).vary "Accept"
+  return response
 
 -- ==========================================
 -- Proofs

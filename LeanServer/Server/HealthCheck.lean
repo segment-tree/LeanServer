@@ -1,6 +1,6 @@
 import LeanServer.Server.HTTPServer
 import LeanServer.Server.Concurrency
-import LeanServer.Server.Metrics
+import LeanServer.HTTP.Health
 
 /-!
 # Deep Health Check (R23)
@@ -26,63 +26,16 @@ already in HTTPServer.lean. Deep checks verify internal subsystem health.
 namespace LeanServer
 
 -- ==========================================
--- Health Check Types
--- ==========================================
-
-/-- Health status of a subsystem -/
-inductive HealthStatus where
-  | healthy
-  | degraded (reason : String)
-  | unhealthy (reason : String)
-  deriving Inhabited, BEq, Repr
-
-instance : ToString HealthStatus where
-  toString
-    | .healthy       => "HEALTHY"
-    | .degraded r    => s!"DEGRADED: {r}"
-    | .unhealthy r   => s!"UNHEALTHY: {r}"
-
-/-- Overall health status -/
-def HealthStatus.isUp : HealthStatus → Bool
-  | .healthy     => true
-  | .degraded _  => true
-  | .unhealthy _ => false
-
-/-- A single health check result -/
-structure HealthCheckResult where
-  name     : String
-  status   : HealthStatus
-  durationMs : Nat
-  details  : List (String × String) := []
-  deriving Inhabited, Repr
-
-/-- Composite health check report -/
-structure HealthReport where
-  overall    : HealthStatus
-  checks     : List HealthCheckResult
-  serverUpMs : Nat
-  timestamp  : Nat
-  version    : String := "0.1.0"
-  deriving Inhabited, Repr
-
--- ==========================================
 -- Individual Health Checks
 -- ==========================================
 
 /-- Check thread pool health -/
 def checkThreadPool : IO HealthCheckResult := do
   let startMs ← IO.monoMsNow
-  let count ← getActiveThreadCount
-  let threads := count.toNat
+  let (threads, maxThreads, _) ← getPoolStats
   let endMs ← IO.monoMsNow
-  let maxThreads := maxConcurrentConnections
   let utilization := if maxThreads > 0 then threads * 100 / maxThreads else 0
-  let status := if utilization > 90 then
-    HealthStatus.degraded s!"Thread utilization at {utilization}%"
-  else if utilization > 99 then
-    HealthStatus.unhealthy s!"Thread pool exhausted ({threads}/{maxThreads})"
-  else
-    HealthStatus.healthy
+  let status := threadPoolHealth threads maxThreads
   return { name := "thread_pool", status, durationMs := endMs - startMs
            details := [("active", toString threads), ("max", toString maxThreads)
                        , ("utilization_pct", toString utilization)] }
@@ -181,14 +134,7 @@ def deepHealthCheck (certPath keyPath : String) (configPath : String := "server.
   let checks := [threadCheck, certCheck, configCheck, memoryCheck, rateLimitCheck]
 
   -- Overall: unhealthy if any check is unhealthy; degraded if any is degraded
-  let overall := checks.foldl (fun acc c =>
-    match acc, c.status with
-    | HealthStatus.unhealthy _, _ => acc
-    | _, HealthStatus.unhealthy r => HealthStatus.unhealthy r
-    | HealthStatus.degraded _, _ => acc
-    | _, HealthStatus.degraded r => HealthStatus.degraded r
-    | _, _ => acc
-  ) HealthStatus.healthy
+  let overall := aggregateHealth checks
 
   return { overall, checks, serverUpMs := uptimeMs, timestamp }
 
@@ -209,46 +155,5 @@ def livenessCheck : IO HealthReport := do
   let uptimeMs ← getServerUptimeMs
   -- If we can reach this point, the server is alive
   return { overall := .healthy, checks := [], serverUpMs := uptimeMs, timestamp }
-
--- ==========================================
--- Health Check HTTP Response
--- ==========================================
-
-/-- Format a health check result as JSON -/
-def HealthCheckResult.toJSON (r : HealthCheckResult) : String :=
-  let statusStr := match r.status with
-    | .healthy => "UP" | .degraded _ => "DEGRADED" | .unhealthy _ => "UP"
-  let detailsJson := String.intercalate "," (r.details.map fun (k, v) => s!"\"{k}\":\"{v}\"")
-  let message := match r.status with
-    | .healthy => "" | .degraded m => m | .unhealthy m => m
-  s!"\{\"name\":\"{r.name}\",\"status\":\"{statusStr}\",\"duration_ms\":{r.durationMs},\"message\":\"{message}\",\"details\":\{{detailsJson}}}"
-
-/-- Format a health report as JSON -/
-def HealthReport.toJSON (report : HealthReport) : String :=
-  let statusStr := match report.overall with
-    | .healthy => "UP" | .degraded _ => "DEGRADED" | .unhealthy _ => "DOWN"
-  let checksJson := String.intercalate ",\n    " (report.checks.map HealthCheckResult.toJSON)
-  s!"\{\"status\":\"{statusStr}\",\"version\":\"{report.version}\",\"uptime_ms\":{report.serverUpMs},\"timestamp\":{report.timestamp},\"checks\":[\n    {checksJson}\n  ]}"
-
-/-- Generate health check HTTP response -/
-def healthCheckResponse (report : HealthReport) : HTTPResponse :=
-  let statusCode := if report.overall.isUp then "200" else "503"
-  { statusCode
-    contentType := "application/json"
-    body := report.toJSON
-    extraHeaders := [("cache-control", "no-cache, no-store")] }
-
--- ==========================================
--- Proofs
--- ==========================================
-
-/-- Healthy status is always up -/
-theorem healthy_is_up : HealthStatus.healthy.isUp = true := rfl
-
-/-- Unhealthy status is never up -/
-theorem unhealthy_is_not_up (r : String) : (HealthStatus.unhealthy r).isUp = false := rfl
-
-/-- Degraded status is still up -/
-theorem degraded_is_up (r : String) : (HealthStatus.degraded r).isUp = true := rfl
 
 end LeanServer

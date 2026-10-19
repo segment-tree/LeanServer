@@ -223,8 +223,13 @@ structure SpanCollector where
 initialize spanCollectorRef : IO.Ref SpanCollector ← do
   IO.mkRef { spans := [], droppedCount := 0, totalCount := 0, config := {} }
 
+initialize spanCollectorMutex : Std.Mutex Unit ← Std.Mutex.new ()
+
+private def readSpanCollector : IO SpanCollector :=
+  spanCollectorMutex.atomically spanCollectorRef.get
+
 /-- Initialize the tracing system -/
-def initTracing (config : TracingConfig) : IO Unit :=
+def initTracing (config : TracingConfig) : IO Unit := spanCollectorMutex.atomically do
   spanCollectorRef.set { spans := [], droppedCount := 0, totalCount := 0, config }
 
 /-- Create a new root span -/
@@ -232,7 +237,7 @@ def startRootSpan (name : String) (kind : SpanKind := .server) : IO Span := do
   let traceId ← generateHexId 16   -- 32 hex chars
   let spanId ← generateHexId 8     -- 16 hex chars
   let nowMs ← IO.monoMsNow
-  let collector ← spanCollectorRef.get
+  let collector ← readSpanCollector
   return { traceId, spanId, name, kind, startTimeMs := nowMs
            serviceName := collector.config.serviceName }
 
@@ -247,7 +252,7 @@ def startChildSpan (parent : Span) (name : String) (kind : SpanKind := .internal
 def startSpanFromTraceparent (traceparent : String) (name : String) (kind : SpanKind := .server) : IO Span := do
   let spanId ← generateHexId 8
   let nowMs ← IO.monoMsNow
-  let collector ← spanCollectorRef.get
+  let collector ← readSpanCollector
   match parseTraceparent traceparent with
   | some ctx =>
     return { traceId := ctx.traceId, spanId, parentSpanId := ctx.parentId
@@ -259,7 +264,7 @@ def startSpanFromTraceparent (traceparent : String) (name : String) (kind : Span
              serviceName := collector.config.serviceName }
 
 /-- Finish and collect a span -/
-def finishSpan (span : Span) (status : SpanStatusCode := .ok) : IO Span := do
+def finishSpan (span : Span) (status : SpanStatusCode := .ok) : IO Span := spanCollectorMutex.atomically do
   let nowMs ← IO.monoMsNow
   let finished := span.finish nowMs status
   let collector ← spanCollectorRef.get
@@ -286,17 +291,8 @@ def finishSpan (span : Span) (status : SpanStatusCode := .ok) : IO Span := do
   return finished
 
 /-- Finish a span with error status -/
-def finishSpanError (span : Span) (errorMsg : String) : IO Span := do
-  let nowMs ← IO.monoMsNow
-  let finished := span.finishError nowMs errorMsg
-  let collector ← spanCollectorRef.get
-  let spans' := if collector.spans.length >= collector.config.maxBufferSize then
-    collector.spans.drop 1 ++ [finished]
-  else
-    collector.spans ++ [finished]
-  spanCollectorRef.set { collector with
-    spans := spans', totalCount := collector.totalCount + 1 }
-  return finished
+def finishSpanError (span : Span) (errorMsg : String) : IO Span :=
+  finishSpan { span with statusMessage := errorMsg } .error_
 
 -- ==========================================
 -- B3 Propagation Format (Zipkin)
@@ -367,12 +363,12 @@ def spanToOTLPJSON (span : Span) : String :=
 
 /-- Export all collected spans as OTLP JSON batch -/
 def exportSpansOTLP : IO String := do
-  let collector ← spanCollectorRef.get
+  let collector ← readSpanCollector
   let spansJson := String.intercalate ",\n    " (collector.spans.map spanToOTLPJSON)
   return s!"\{\"resourceSpans\":[\{\"resource\":\{\"attributes\":[\{\"key\":\"service.name\",\"value\":\{\"stringValue\":\"{collector.config.serviceName}\"}}]},\"scopeSpans\":[\{\"spans\":[{spansJson}]}]}]}"
 
 /-- Drain all collected spans (export and clear) -/
-def drainSpans : IO (List Span) := do
+def drainSpans : IO (List Span) := spanCollectorMutex.atomically do
   let collector ← spanCollectorRef.get
   spanCollectorRef.set { collector with spans := [], droppedCount := 0 }
   return collector.spans
@@ -414,7 +410,7 @@ structure TracingStats where
   deriving Inhabited, Repr
 
 def getTracingStats : IO TracingStats := do
-  let collector ← spanCollectorRef.get
+  let collector ← readSpanCollector
   return { bufferedSpans := collector.spans.length
            totalSpans := collector.totalCount
            droppedSpans := collector.droppedCount }
@@ -442,6 +438,30 @@ def withSpan (name : String) (kind : SpanKind := .internal)
 -- ==========================================
 -- Proofs
 -- ==========================================
+
+/-- The tracing backend is explicit, so the middleware also runs in model monads. -/
+def tracingMiddlewareWith [Monad m] (start : HTTP.Context → m Span)
+    (finish : Span → HTTP.Response → m Unit) : HTTP.Middleware m := fun next ctx => do
+  let span ← start ctx
+  let parent := (injectTraceparent span).head!.2
+  let response ← next (ctx.setLocal "traceparent" parent)
+  finish span response
+  return response.withHeader "traceparent" parent
+
+/-- IO tracing spans the actual handler and records exceptions before rethrowing. -/
+def tracingMiddleware : HTTP.Middleware IO := fun next ctx => do
+  let span ← startSpanFromTraceparent ((ctx.request.headers.get? "traceparent").getD "")
+    s!"{ctx.request.method} {ctx.path}" .server
+  let parent := (injectTraceparent span).head!.2
+  try
+    let response ← next (ctx.setLocal "traceparent" parent)
+    let _ ← finishSpan (span.addHTTPServerAttrs ctx.request.method ctx.path response.status.toNat
+      (ctx.connection.peerAddress.getD "") (ctx.request.scheme.getD "http"))
+      (if response.status ≥ 500 then .error_ else .ok)
+    return response.withHeader "traceparent" parent
+  catch error =>
+    let _ ← finishSpanError span (toString error)
+    throw error
 
 /-- A finished span is not active -/
 theorem finished_span_not_active (s : Span) (nowMs : Nat) (h : nowMs > 0) :

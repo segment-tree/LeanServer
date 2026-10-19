@@ -1,7 +1,7 @@
 -- LeanServer — Root Library Module (Full)
 --
--- This file imports all public modules that do NOT depend on HTTPServer.
--- HTTPServer.lean imports this root, so including it here would create a cycle.
+-- Legacy full umbrella, including optional crypto and database backends.
+-- HTTPServer imports LeanServerPure directly and does not require this module.
 --
 -- For the pure subset (zero C dependencies), use `import LeanServerPure` instead.
 -- See LeanServerPure.lean for details on the pure library.
@@ -15,15 +15,15 @@
 --   Proofs    : Formal verification — 914 theorems, 0 axioms, 0 sorry (1 module)
 --   Spec      : Formal specifications and refinement proofs (11 modules)
 --
--- NOT imported here (29 modules — depend on HTTPServer, which imports this root):
+-- Runtime extensions and Web convenience APIs are imported separately:
 --   Server.HTTPServer and all Server.HTTPServer.* extensions
 --   Server middleware: Benchmark, BlueGreen, Canary, CircuitBreaker, ConfigReload,
 --     ContentNegotiation, CORS, DistributedTracing, GracefulShutdown, HealthCheck,
 --     Metrics, Production, RequestId, ResponseCompression, Timeout
 --   Web.*: WebApplication, WebApplicationSimple, SampleWebApp, WebAppTests
 --
--- These 29 modules are built as part of the library but must be imported
--- individually (e.g. `import LeanServer.Server.HTTPServer`).
+-- The canonical HTTP/Web application API is exported by LeanServerPure.
+-- Import LeanServer.Server.HTTPServer explicitly to execute an application.
 
 -- ── Core ──────────────────────────────────────────────────
 import LeanServer.Core.Basic

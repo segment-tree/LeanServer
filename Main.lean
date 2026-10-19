@@ -1,4 +1,4 @@
-import LeanServer
+import LeanServerPure
 import LeanServer.Crypto.Crypto
 import LeanServer.Protocol.HTTP2
 import LeanServer.Protocol.HTTP3
@@ -24,30 +24,31 @@ def main : IO Unit := do
 
   -- Register external middleware (see ROADMAP.md F2.1)
   IO.eprintln "🔧 Registering middleware pipeline..."
-  registerMiddlewares [
+  let middlewares : List (HTTP.Middleware IO) := [
     RequestId.requestIdMiddleware {},  -- X-Request-Id header
     advancedCORSMiddleware {},        -- Configurable CORS
     contentNegotiationMiddleware,     -- Content-Type negotiation
-    compressionMiddleware {}          -- Response compression (gzip)
+    compressionMiddleware {},         -- Response compression (gzip)
+    tracingMiddleware
   ]
   IO.eprintln "   ✅ Registered: RequestId, CORS, ContentNegotiation, Compression"
 
   -- Register health endpoints (see ROADMAP.md F2.2)
   IO.eprintln "🩺 Registering health & metrics endpoints..."
-  registerRoute "GET" "/health/deep" fun _ => do
+  let router : HTTP.Router IO := ({} : HTTP.Router IO).get "/health/deep" fun _ => do
     let report ← deepHealthCheck "cert.pem" "key.pem"
     pure (healthCheckResponse report)
-  registerRoute "GET" "/ready" fun _ => do
+  let router := router.get "/ready" fun _ => do
     let report ← readinessCheck
     pure (healthCheckResponse report)
-  registerRoute "GET" "/livez" fun _ => do
+  let router := router.get "/livez" fun _ => do
     let report ← livenessCheck
     pure (healthCheckResponse report)
 
   -- Register metrics endpoint (see ROADMAP.md F2.3)
-  registerRoute "GET" "/metrics" fun _ => do
+  let router := router.get "/metrics" fun _ => do
     let body ← generatePrometheusMetrics
-    return { statusCode := "200", contentType := "text/plain; version=0.0.4; charset=utf-8", body := body }
+    return (HTTP.Response.text body).withHeader "content-type" "text/plain; version=0.0.4; charset=utf-8"
   IO.eprintln "   ✅ Registered: /health/deep, /ready, /livez, /metrics"
 
   -- Register graceful shutdown coordinator (see ROADMAP.md F2.4)
@@ -73,16 +74,6 @@ def main : IO Unit := do
     | none => IO.eprintln "   ℹ️  No config changes detected"
   IO.eprintln "   ✅ ConfigReload registered (poll=10s, SIGHUP supported)"
 
-  -- Register distributed tracing hook (see ROADMAP.md F2.6)
-  IO.eprintln "🔍 Registering distributed tracing..."
-  registerTracingHook fun method path traceparent => do
-    let span ← startSpanFromTraceparent
-      (if traceparent.isEmpty then "00-0000000000000000-0000000000000000-00" else traceparent)
-      s!"{method} {path}" .server
-    let finished ← finishSpan span .ok
-    return injectTraceparent finished
-  IO.eprintln "   ✅ Distributed tracing registered (W3C traceparent propagation)"
-
   -- Load Credentials
   IO.eprintln "🔑 Loading credentials..."
   let certOpt ← LeanServer.loadCertificateDER "cert.pem"
@@ -95,6 +86,5 @@ def main : IO Unit := do
 
   IO.eprintln "✅ Credentials loaded"
 
-  -- Initialize and run the HTTPS server
-  let server ← LeanServer.initHTTPServer 4433
-  LeanServer.runHTTPServer server
+  LeanServer.serveIO { port := 4433, enableTLS := true, enableHTTP2 := true }
+    (HTTP.Middleware.all middlewares router.dispatch)

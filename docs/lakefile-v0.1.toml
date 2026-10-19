@@ -1,3 +1,4 @@
+# Historical v0.1 configuration. The live build is lakefile.lean.
 name = "LeanServer"
 version = "0.1.0"
 defaultTargets = ["LeanServer"]

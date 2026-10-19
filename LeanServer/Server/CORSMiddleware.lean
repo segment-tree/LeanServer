@@ -1,4 +1,4 @@
-import LeanServer.Server.HTTPServer
+import LeanServer.HTTP.Middleware
 
 /-!
 # Advanced CORS Middleware (R25)
@@ -91,7 +91,7 @@ def isOriginAllowed (origin : String) (config : CORSConfig) : Bool :=
 
 /-- Check if a method is allowed -/
 def isMethodAllowed (method : String) (config : CORSConfig) : Bool :=
-  config.allowedMethods.any (· == method.toUpper)
+  config.allowedMethods.any (· == method)
 
 /-- Check if a header is allowed (case-insensitive) -/
 def isHeaderAllowed (header : String) (config : CORSConfig) : Bool :=
@@ -147,22 +147,6 @@ def corsPreflightHeaders (origin : String) (config : CORSConfig) : List (String 
 -- CORS Middleware
 -- ==========================================
 
-/-- Advanced CORS middleware with configurable origin validation -/
-def advancedCORSMiddleware (config : CORSConfig := {}) : Middleware := {
-  name := "advanced-cors"
-  apply := fun method _ _ _ resp =>
-    -- In the middleware pipeline, we don't have direct access to the Origin header.
-    -- The middleware adds headers assuming the origin was validated at the server level.
-    -- For OPTIONS preflight:
-    if method == "OPTIONS" then
-      let preflightHeaders := corsPreflightHeaders "*" config
-      { statusCode := "204", contentType := "text/plain", body := ""
-        extraHeaders := preflightHeaders }
-    else
-      let headers := corsResponseHeaders "*" config
-      { resp with extraHeaders := resp.extraHeaders ++ headers }
-}
-
 /-- Process a CORS request with full origin validation.
     Call this at the server level where headers are available. -/
 def processCORSRequest (method : String) (headers : List (String × String))
@@ -175,18 +159,28 @@ def processCORSRequest (method : String) (headers : List (String × String))
   else if method == "OPTIONS" then .preflight origin
   else .allowed origin
 
-/-- Apply CORS result to an HTTP response -/
-def applyCORSResult (resp : HTTPResponse) (result : CORSResult) (config : CORSConfig) : HTTPResponse :=
+/-- Apply validated CORS fields without replacing other Vary values. -/
+def applyCORSResult (resp : HTTP.Response) (result : CORSResult) (config : CORSConfig) : HTTP.Response :=
+  let add (response : HTTP.Response) (fields : List (String × String)) :=
+    fields.foldl (fun acc (name, value) =>
+      if name == "vary" then acc.vary value else acc.withHeader name value) response
   match result with
-  | .allowed origin =>
-    if origin.isEmpty then resp
-    else { resp with extraHeaders := resp.extraHeaders ++ corsResponseHeaders origin config }
-  | .denied =>
-    { statusCode := "403", contentType := "text/plain", body := "CORS origin not allowed"
-      extraHeaders := [] }
-  | .preflight origin =>
-    { statusCode := "204", contentType := "text/plain", body := ""
-      extraHeaders := corsPreflightHeaders origin config }
+  | .allowed origin => if origin.isEmpty then resp else add resp (corsResponseHeaders origin config)
+  | .denied => HTTP.Response.text "CORS origin not allowed" 403
+  | .preflight origin => add { status := 204 } (corsPreflightHeaders origin config)
+
+/-- Reads Origin and preflight fields before calling the application. -/
+def advancedCORSMiddleware [Monad m] (config : CORSConfig := {}) : HTTP.Middleware m := fun next ctx => do
+  let some origin := ctx.request.headers.get? "origin" | return ← next ctx
+  if !isOriginAllowed origin config then return HTTP.Response.text "CORS origin not allowed" 403
+  let requestedMethod := ctx.request.headers.get? "access-control-request-method"
+  if ctx.request.method == "OPTIONS" && requestedMethod.isSome then
+    let headers := ((ctx.request.headers.get? "access-control-request-headers").getD "").splitOn ","
+    if !isMethodAllowed (requestedMethod.getD "") config ||
+        headers.any (fun h => !h.trimAscii.toString.isEmpty && !isHeaderAllowed h.trimAscii.toString config) then
+      return HTTP.Response.text "CORS preflight not allowed" 403
+    return applyCORSResult {} (.preflight origin) config
+  return applyCORSResult (← next ctx) (.allowed origin) config
 
 -- ==========================================
 -- Proofs

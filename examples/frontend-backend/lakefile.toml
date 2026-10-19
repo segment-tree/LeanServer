@@ -1,0 +1,31 @@
+name = "frontend-backend"
+version = "0.1.0"
+defaultTargets = ["frontend", "backend"]
+
+[[require]]
+name = "LeanServer"
+path = "../.."
+
+[[lean_lib]]
+name = "FrontendBackend"
+roots = ["Proxy", "FrontendCore", "BackendCore", "Proof.Proof", "Proof.ServiceProofs", "Proof.ForwardingProofs", "Proof.ByteFramingProofs", "Proof.CodecProofs", "Proof.DecimalProofs", "Proof.AsciiHTTPProofs", "Proof.TrimProofs", "Proof.StringJoinProofs", "Proof.HTTPStringProofs", "Proof.RequestFramingProofs", "Proof.RequestHeadProofs", "Proof.HTTPDecimalProofs", "Proof.ResponseHeadProofs", "Proof.ExchangeGraph", "Proof.ApplicationExchange", "Proof.Proofv2", "Proof.GraphExamples"]
+
+[[lean_exe]]
+name = "frontend"
+root = "Frontend"
+
+[[lean_exe]]
+name = "backend"
+root = "Backend"
+
+[[lean_exe]]
+name = "proxy-tests"
+root = "Test.ProxyTests"
+
+[[lean_exe]]
+name = "frontend-policy-tests"
+root = "Test.PolicyTests"
+
+[[lean_exe]]
+name = "backend-policy-tests"
+root = "Test.BackendPolicyTests"

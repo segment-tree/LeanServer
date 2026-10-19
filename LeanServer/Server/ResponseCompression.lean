@@ -1,4 +1,4 @@
-import LeanServer.Server.HTTPServer
+import LeanServer.Server.ContentNegotiation
 
 /-!
 # HTTP Response Compression (R27)
@@ -199,17 +199,18 @@ def isCompressible (contentType : String) (config : CompressionConfig := {}) : B
   config.compressibleTypes.any fun allowed =>
     ct.startsWith allowed || ct == allowed
 
-/-- Check if a string contains a substring -/
-private def strContains (haystack : String) (needle : String) : Bool :=
-  (haystack.splitOn needle).length > 1
-
-/-- Select the best compression encoding from Accept-Encoding -/
+/-- Honor exact encoding names, q=0 exclusions, and wildcard fallback. -/
 def selectEncoding (acceptEncoding : String) (config : CompressionConfig := {}) : CompressionEncoding :=
-  let normalized := acceptEncoding.toLower
-  -- Check preferred order
-  match config.preferredOrder.find? (fun enc => strContains normalized (toString enc)) with
-  | some enc => enc
-  | none     => .identity
+  let accepted := parseAcceptEncoding acceptEncoding
+  let quality (encoding : CompressionEncoding) :=
+    match accepted.find? (fun e => e.encoding == toString encoding) with
+    | some e => e.quality
+    | none => (accepted.find? (fun e => e.encoding == "*")).map (·.quality) |>.getD 0
+  let candidates := config.preferredOrder.filter (· != .identity)
+  let best := candidates.foldl (fun (best, q) encoding =>
+    let next := quality encoding
+    if next > q then (encoding, next) else (best, q)) (.identity, 0)
+  best.1
 
 /-- Should we compress this response? -/
 def shouldCompress (bodySize : Nat) (contentType : String)
@@ -227,38 +228,39 @@ def shouldCompress (bodySize : Nat) (contentType : String)
 -- Response Compression
 -- ==========================================
 
+/-- HTTP deflate uses a zlib wrapper, not bare DEFLATE blocks. -/
+def zlibCompress (body : ByteArray) : ByteArray := Id.run do
+  let mut a : UInt32 := 1
+  let mut b : UInt32 := 0
+  for byte in body do
+    a := (a + byte.toUInt32) % 65521
+    b := (b + a) % 65521
+  let checksum := (b <<< 16) ||| a
+  return ByteArray.mk #[0x78, 0x01] ++ deflateStoredBlock body ++
+    ByteArray.mk #[(checksum >>> 24).toUInt8, (checksum >>> 16).toUInt8,
+      (checksum >>> 8).toUInt8, checksum.toUInt8]
+
 /-- Compress an HTTP response body -/
 def compressResponseBody (body : ByteArray) (encoding : CompressionEncoding) : ByteArray :=
   match encoding with
   | .gzip    => gzipCompress body
-  | .deflate => deflateStoredBlock body
+  | .deflate => zlibCompress body
   | .identity => body
 
-/-- Apply compression to an HTTPResponse -/
-def compressResponse (resp : HTTPResponse) (acceptEncoding : String)
-    (config : CompressionConfig := {}) : HTTPResponse :=
-  let bodyBytes := resp.body.toUTF8
-  match shouldCompress bodyBytes.size resp.contentType acceptEncoding config with
-  | none => resp
-  | some encoding =>
-    let compressed := compressResponseBody bodyBytes encoding
-    -- For gzip/deflate responses, we return the body size info in headers
-    -- Note: The actual compressed bytes would need to be sent as binary
-    -- Here we add the appropriate headers for the compression
-    { resp with
-      extraHeaders := resp.extraHeaders ++
-        [ ("content-encoding", toString encoding)
-        , ("x-uncompressed-size", toString bodyBytes.size)
-        , ("x-compressed-size", toString compressed.size)
-        , ("vary", "Accept-Encoding") ] }
+/-- Encode the actual bytes and keep the transport responsible for Content-Length. -/
+def compressResponse (resp : HTTP.Response) (acceptEncoding : String)
+    (config : CompressionConfig := {}) : HTTP.Response :=
+  if (resp.headers.get? "content-encoding").isSome || resp.status == 204 || resp.status == 304 then resp
+  else
+    let varied := resp.vary "Accept-Encoding"
+    match shouldCompress resp.body.size ((resp.headers.get? "content-type").getD "") acceptEncoding config with
+    | none => varied
+    | some encoding =>
+      { varied with body := compressResponseBody resp.body encoding }
+        |>.withHeader "content-encoding" (toString encoding)
 
-/-- Compression middleware -/
-def compressionMiddleware (_config : CompressionConfig := {}) : Middleware := {
-  name := "compression"
-  apply := fun _ _ _ _ resp =>
-    -- Add Vary header to indicate encoding negotiation
-    { resp with extraHeaders := resp.extraHeaders ++ [("vary", "Accept-Encoding")] }
-}
+def compressionMiddleware [Monad m] (config : CompressionConfig := {}) : HTTP.Middleware m := fun next ctx => do
+  return compressResponse (← next ctx) ((ctx.request.headers.get? "accept-encoding").getD "") config
 
 -- ==========================================
 -- Proofs

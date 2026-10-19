@@ -1,5 +1,21 @@
 # 🌟 Exemplos Práticos - LeanServer
 
+## Current runnable examples (0.2 development)
+
+- [`header-echo`](header-echo/): independent Lake consumer; a pure handler
+  returns header A or a fixed error response.
+- [`basic-server`](basic-server/README.md): independent Lake consumer with the
+  canonical routing DSL, served by the existing HTTPServer.
+- [`frontend-backend`](frontend-backend/README.md): two independent HTTP
+  services with plain-header authentication and a localhost backend proxy.
+- [`HeaderEcho.lean`](HeaderEcho.lean): repository executable with bind address,
+  port, and optional TLS arguments (`lake build header_echo`).
+
+See [APPLICATION_API.md](../docs/APPLICATION_API.md) for tested commands and
+runtime boundaries. The older tutorial below is historical; its API sketches,
+production claims, and directory names are not a verified runnable guide to
+the current API.
+
 Esta pasta contém exemplos práticos de uso do LeanServer para diferentes cenários de produção.
 
 ## 📁 Exemplos Disponíveis

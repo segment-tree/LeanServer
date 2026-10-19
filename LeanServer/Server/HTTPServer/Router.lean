@@ -10,7 +10,7 @@ import LeanServer.Server.HTTPServer
   - `Middleware` — Request/Response middleware
 
   ## Key Functions
-  - `routeRequest` — Route a request to a handler
+  - `HTTP.Router.dispatch` — Dispatch through an explicit application router
   - `applyMiddleware` — Apply middleware chain
   - `serveStaticFile` — Serve static files from disk
   - `sendErrorResponse` — Send error response
@@ -26,8 +26,8 @@ import LeanServer.Server.HTTPServer
 namespace LeanServer.Router
 
 /-- Route an HTTP request -/
-@[inline] def route (method path : String) (proto : String := "https") (body : String := "") : IO LeanServer.HTTPResponse :=
-  LeanServer.routeRequest method path proto body
+@[inline] def route [Monad m] (router : HTTP.Router m) (ctx : HTTP.Context) : m HTTP.Response :=
+  router.dispatch ctx
 
 /-- Parse raw HTTP request -/
 @[inline] def parse (raw : String) : Option LeanServer.HTTPRequest :=
