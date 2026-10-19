@@ -82,258 +82,178 @@ driver is required.
 Build proofs explicitly; the default executable build does not check them:
 
 ```sh
-lake -d examples/frontend-backend build Proof.Proof Proof.Proofv2 Proof.GraphExamples
+lake -d examples/frontend-backend build Proof.Proofv2 Proof.GraphExamples
 ```
 
-`Proof/Proof.lean` is the original model. `Proof/Proofv2.lean` records the frontend and
-backend connection bytes and partial sends. It computes the upstream call from
-execution of the frontend code.
-`Proof/ServiceProofs.lean` proves properties of the application code. Frontend-owned
-credential removal followed by the generic proxy encoder preserves the old
-combined encoder byte for byte (`encodeUpstreamRequest_unchanged`).
-`Proof/ForwardingProofs.lean` defines input size constraints and proves bounds for the
-actual encoder. `encodeUpstreamHead` is the header section used directly by
-`encodeUpstreamRequest`; extracting it preserves the same byte-equivalence proof.
-`Proof/CodecProofs.lean` proves invariants of the actual parser and body preservation
-by the actual encoders. Successful request parsing supplies valid method, target,
-and headers, including when the parser takes the chunked body branch. These are
-derived from `parseHTTP1`, not additional input restrictions. Credential and
-protocol-header filtering preserves header validity. The complete forwarding
-roundtrip also proves that the parser finds the encoder's header boundary,
-recovers the method, target, and body, and consumes all forwarded bytes.
+`Proof/Proofv2.lean` proves the policy on the specified, fixed frontend/backend
+network. The final theorem is:
 
-The following properties are proved rather than assumed in `Contracts`:
+```lean
+theorem remote_resource_iff_credentials
+    (source : Upstream)
+    (contracts : Contracts (frontendBackendGraph source))
+    (wire : ByteArray) (hRequest : ResourceInput wire) :
+    observed (frontendBackendGraph source) contracts wire = expectedResource wire ↔
+      credentialsMatch (context wire) = true
+```
 
-- For a resource request, rejected credentials cause no upstream call.
-- Accepted credentials cause exactly one call with `backendAddr` and the
-  frontend-rewritten request. The rewrite preserves method, target, and body.
-  These follow from the handler's execution, without runtime contracts
-  (`frontend_authorized_calls`). `upstreamRequest` connects calls to ordered
-  child edges; `application_calls_match` proves their target addresses agree.
-- For the frontend-rewritten request, the retained headers contain neither
-  username nor password headers, and
-  the actual header serializer uses these retained headers. This does **not
-  yet prove** that the backend's parsed headers omit credentials.
-- `wireResponse` always satisfies `Response.valid`, including the generated
-  decimal Content-Length and Connection headers.
-- The fixed 401 response has a complete encoding/decoding roundtrip in either
-  connection mode (`unauthorized_roundtrip`).
-- `json_response_roundtrip` proves the actual encoder/observer roundtrip for
-  status 200, the fixed JSON content type, and **any binary body**, for both
-  connection modes. `resource_roundtrip` and `forwarded_resource_roundtrip`
-  therefore have no remaining codec admissions.
-- `remote_resource_requires_credentials` proves the necessary-credentials
-  direction with transport, runtime correspondence, and the explicit application topology, without
-  any admitted codec theorem. The final iff theorem reuses this direction.
-- `backend_request_delivered` derives complete parsing of the bytes received by
-  the backend and preservation of method, target, and body. It uses request
-  transport, frontend call/encoding correspondence, and the forwarding theorem;
-  neither a backend parsing assumption nor `backendReply` supplies this result.
-- `forwarded_request_roundtrip` independently proves that every originally parsed
-  GET request satisfying `ForwardingConstraint` parses completely after forwarding,
-  with unchanged method, target, and body. It uses no transport/runtime contracts.
-- `responseHeaders_wire`, `wireResponse_wire`, and `encodeHTTP1_wire` prove that
-  rebuilding framing headers and re-encoding a valid ordinary GET response is
-  equivalent to encoding the original response for the client's connection mode.
-  These lemmas contain no `sorry` and use no unfinished roundtrip proof.
+`source` is the client's IP and source port, with no restriction on either.
+`wire` is its raw HTTP request. The graph is defined independently of the
+request. `contracts` supplies the two reliable operations described below.
+`hRequest` restricts the parsed request to the resource endpoint and the proved
+size limits. The conclusion compares the client's received response status and
+body with the backend's expected resource response. It does not compare every
+response header. Correct credentials mean exactly one X-Username value `Tom`
+and exactly one X-Password value `123456`; missing, incorrect, or duplicate
+credential headers fail the check.
 
-`ResourceRequest.forwardingConstraint` applies to the original parsed request,
-before credential removal:
+### Fixed graph and execution
+
+`Proof/NetworkGraph.lean` defines a generic network DAG:
+
+- `nodes : List (Handler AppM)` stores actual handlers, with arbitrary service
+  count. There are no frontend/backend program labels in the graph type.
+- `none` is the distinguished client node; `some i` is service `i`. The client
+  initiates the request and receives its response, and has no handler.
+- `routes caller callee` expresses network reachability, independently of calls
+  made during execution. Responses travel back over the established connection;
+  they do not require another directed call edge.
+- `addresses` and `resolve` associate services with their upstream addresses;
+  their consistency is part of a well-formed graph.
+- `clientAddress` stores the source endpoint. `entry` selects the initial service
+  called by the client. `noIncomingClient` excludes new calls into the client.
+- Decreasing node ranks prove acyclicity and termination of nested dispatch.
+
+`AppM` describes a returned value or an upstream request with its continuation.
+Its monad laws are proved. Existing polymorphic handlers run in it without
+rewriting application policy. `Proof/NetworkExecution.lean` interprets every
+upstream effect by resolving its address, checking the network route, sending
+encoded bytes, parsing the received request, and executing the actual handler
+stored at the target node. It recursively processes any further calls that
+handler makes. There is no fixed call depth or fuel bound.
+
+`Proof/ApplicationGraph.lean` defines `frontendBackendGraph source`. It stores
+`frontendWith callUpstream` and `backendCore` as its two service handlers and
+has the fixed client→frontend and frontend→backend routes. The backend route
+remains present for incorrect credentials; the frontend simply does not call it.
+`frontendBackendGraph_application` proves the service identities, backend
+address, and required routes from this definition. These are not additional
+premises supplied to the final theorem.
+
+`resource_iff_on_network` is the supporting theorem for any network with the
+specified frontend/backend handlers and routes. `Proof/GraphExamples.lean`
+instantiates it on a network with four services plus the client, branching
+routes, a shared backend, and two arbitrary extra handlers. The generic model
+is therefore not restricted to the application's three-node topology.
+
+The earlier interaction-record graph and `ApplicationInput` constructor were
+removed. Execution no longer creates or removes network edges. The graph is
+passed to the interpreter and is never modified by a request. The separate old
+pure policy model has also been removed. See [the proof file map](Proof/README.md)
+for every current module's role and dependencies.
+
+### Complete list of environmental contracts
+
+There is no separate `Environment` parameter. Each contract packages its
+operation with its reliability proof, so these structures live in `Type`:
+
+| Contract | Operation | Required property |
+| --- | --- | --- |
+| `SocketContracts graph` | `send caller callee direction payload` | For any nodes, direction and payload, bytes entering the network equal the submitted payload. |
+| `TransportContracts graph` | `receive caller callee direction payload` | For every reachable caller→callee route, in either direction, received bytes equal the payload. |
+
+`Contracts graph` contains exactly `socket` and `transport`. Neither mentions
+HTTP, credentials, resources, handler results, or parsing success. `delivered_eq`
+proves their composition preserves bytes. Execution uses these operations for
+the client request, upstream request, backend response, and frontend response.
+These are complete, reliable operations; partial writes, errors, retry timing,
+and liveness of the real socket implementation are outside this model.
+
+There is no `RuntimeCorrespondence`, `clientParsed`, `CodecContracts`,
+`ExecutionProperties`, or `ExecutionEvidence` parameter. No response or parsed
+request is independently supplied and equated to what the handler should do.
+
+### Request scope and close mode
+
+`completeRequest wire` invokes the real `parseHTTP1` and returns a request only
+if one complete request consumes the supplied bytes. `ResourceInput wire`
+requires that this computed result satisfies:
 
 | Field | Restriction |
 | --- | --- |
-| `headerCount` | Fewer than 64 headers, counting duplicates and headers later removed. |
-| `headerBytes` | Sum of UTF-8 bytes of all header names and values is at most 48 KiB; excludes separators. |
-| `targetBytes` | Target, including query, is at most 8 KiB in UTF-8. |
-| `bodyBytes` | Decoded body is at most 10 MiB. |
+| `method` | `GET` |
+| `path` | `/resource`; a query string is allowed |
+| `forwardingConstraint.headerCount` | Fewer than 64 original headers, including duplicates and headers later removed |
+| `forwardingConstraint.headerBytes` | Sum of UTF-8 bytes of all header names and values ≤48 KiB, excluding separators |
+| `forwardingConstraint.targetBytes` | Complete request target, including query, ≤8 KiB in UTF-8 |
+| `forwardingConstraint.bodyBytes` | Decoded body ≤10 MiB |
 
-These replace the earlier limit on the complete raw request. They are theorem
-premises, not new runtime rejection rules. They impose no credential-validity
-requirement and do not prohibit duplicate application headers or binary bodies.
+Successful, complete parsing remains part of the request scope; it is not a
+separate assertion relating two independently supplied request representations.
+These restrictions do not assume correct credentials and were not tightened
+for the network proof. They are theorem conditions, not new application checks.
 
-For GET requests to the configured backend, the encoder's exact header size is
-target bytes + retained header content bytes + 4 × retained header count + 76
-+ Content-Length decimal bytes. The constant includes the generated protocol
-fields and the final empty line. `forwarded_head_bound` proves:
+`context wire` builds a context from that parser result. It uses a default
+request only to make the notation total on invalid input; `ResourceInput`
+excludes that branch, and the interpreter never dispatches this fallback.
+Execution supplies the actual peer address from the graph; the credential
+predicate depends only on the parsed request headers.
 
-```text
-encoded header size ≤ 8192 + 49152 + 4 × 63 + 76 + 8 = 57680 < 65536
+`responseClose request` uses exactly the expression in `handlePlainHTTP`:
+
+```lean
+((request.headers.get? "connection").getD "").toLower == "close"
 ```
 
-`forwarded_size_limits` proves that both header and body fit the default parser
-limits without transport, runtime, or codec assumptions. `backend_received_size`
-connects the size bound to delivered backend bytes using transport and runtime
-correspondence; it does not use codec fields. The complete request roundtrip
-combines these bounds with the syntax, framing, and body-extraction proofs.
+Both frontend and backend compute it from their own received request. There is
+no free `close` parameter in execution or the final theorem. General codec
+lemmas still quantify over both close modes. The policy proof works for the
+backend's computed mode without an additional mode assumption.
 
-`Proof/ExchangeGraph.lean` defines the common finite interaction graph. Nodes have a
-program label, optional listening address, and a natural-number rank. Each
-`upstream` edge has a caller, callee, parent request, byte records, source IP and
-port, and response connection mode. Responses use the same edge in reverse;
-only request directions contribute to the DAG.
+### Proof dependencies
 
-`entry` identifies the external request. `children edge` is an ordered list of
-calls made while handling that request. Structural proofs enforce valid finite
-IDs, one root, consistent parent/caller relationships, complete child lists,
-no duplicate child IDs, and strictly increasing node ranks. `acyclic` proves
-there is no nonempty directed cycle. Multiple calls to the same service are
-separate edges and may have different parents; nodes do not store a single
-shared request. These are rooted interaction graphs for one external request,
-not arbitrary disconnected deployments or request-merging workflows.
+The proof executes the real application cores and uses the existing pure HTTP
+encoders/parsers:
 
-`Proofv2.Exchange` extends this graph with the original parsed request. Its
-`client`, `sourceIP`, `sourcePort`, and `clientClose` are computed from the entry
-edge, not independently stored. `backendEdge` is a computed convenience view of
-the first entry child. The graph itself is not restricted to one child:
-`frontend_calls_length_le_one` and `frontend_children` prove that restriction for
-this application from its code and call correspondence.
+- `frontend_run` and `backend_run` prove that interpreting the application effects
+  gives the results of the existing handlers.
+- `invoke_resource` derives successful forwarded parsing and the backend result
+  from the input request, reliable operations, and graph dispatch. Backend
+  request equality, parsing success, and resource output are not assumed.
+- `observed_of_request` connects the computed frontend response with the bytes
+  decoded at the client using the two contracts.
+- The accepted branch uses the backend resource roundtrip and re-encoding proofs.
+  The rejected branch uses the 401 roundtrip; status 401 cannot equal resource
+  status 200. Together these prove both directions of the final equivalence.
 
-`Contracts` bundles only `transport` and `runtime`:
+The existing codec proofs were preserved. Response-specific pure lemmas formerly
+inside `Proofv2.lean` were moved to `Proof/ResponseCodecProofs.lean`:
 
-- `TransportContracts.edges` requires `StableTransport` on every interaction.
-- `RuntimeCorrespondence` connects execution to the graph as described below.
+- `Proof/ForwardingProofs.lean` proves the forwarded header bound of 57680 bytes
+  under the existing constraints, below the parser's 65536-byte limit.
+- `Proof/CodecProofs.lean` proves the complete forwarding roundtrip and preservation
+  of method, target and body. Original requests may use chunked framing; the
+  proxy encodes the decoded body with Content-Length.
+- `Proof/ServiceProofs.lean` proves application rewriting and handler properties.
+- The decimal, UTF-8, split/join, trimming, header and framing proof modules prove
+  the constituent parser/encoder facts without codec contracts.
+- `resource_roundtrip`, `unauthorized_roundtrip`, and `encodeHTTP1_wire` prove
+  response decoding and frontend re-encoding preserve the required status/body.
 
-`Proof/ApplicationExchange.lean` constructs this application's graph from an
-`ApplicationInput`: the original request, client source IP/port, client byte
-records, optional backend byte records, and client close mode. These are data,
-not proof fields. `input.exchange` chooses the one-edge or two-edge construction.
-It sets the node programs, addresses, parent relationships, and connection modes.
-`ApplicationInput.topology` proves their consistency with the application for
-every input, without transport, runtime, credential, or codec premises.
-`FrontendBackendTopology` remains a property used in generic helper lemmas; it
-is not a `Contracts` field or a caller-supplied premise of the final theorem.
+There are no admissions in the final proof. Its axiom audit includes Lean's
+standard `propext`, `Classical.choice`, and `Quot.sound`, plus the existing
+`native_decide` dependencies used by codec proofs. No new business axiom or
+handler-behavior premise was introduced.
 
-| Runtime field | Remaining assumption |
-| --- | --- |
-| `clientParsed` | The entry request bytes parse completely as `e.request`. |
-| `upstreamRequest` | Each child edge sends the encoding of its corresponding call, using `Requests`. |
-| `replies` | Every edge sends the output computed by its receiving node's program, using `Replies`. |
+### Verification boundary
 
-`Aligned` relates two lists element by element, including equal length.
-`upstreamRequest` already supplies the ordered correspondence and equal lengths,
-so the separate `callsMatch` field has been deleted. `frontend_calls_cases`
-proves directly from the application code that execution either makes no call
-or calls `backendAddr` once. `application_calls_match` combines this with the
-constructed graph's callee addresses and `upstreamRequest` to prove the former
-field's complete statement, including target matching. It needs no additional
-topology, transport, valid-credential, or request-size premise. `callCount` and
-`frontend_children` now use `upstreamRequest` for their length equality.
-The parent/child invariants prevent responses from another request being used as
-this request's children. `exchange_edges` proves that with the current topology
-and runtime correspondence, every edge is either the entry or the optional
-backend call.
-
-`Requests connection calls` equates successfully sent request bytes with the
-call encodings. In the graph correspondence each edge receives a singleton call.
-`Replies connection respond` requires successful response sends to equal
-`output` whenever `respond (bytes connection.requestReads) = some output`.
-It assumes neither parsing success nor the existence of output. External client
-requests are not constrained by a service `Requests` contract.
-
-`replyBytes e edge` selects the actual frontend or backend computation according
-to the callee's program. The frontend parses this edge's input and uses this
-edge's own child response, peer address, and close mode. The backend parses its
-received bytes and runs `backendCore`, using the edge's close mode. The existing
-forwarding proof establishes successful backend parsing and field preservation;
-no backend request or response content is independently supplied.
-`frontend_reply_iff` still establishes equivalence with the earlier frontend
-send equality under `clientParsed`. `RuntimeCorrespondence.frontendReply` and
-`backendReply` are derived helpers, not independent contract fields.
-
-The graph's program type is generic. The current application interpreter and
-call correspondence remain specific to this frontend, which issues at most one
-call, and this backend. This change does not prove arbitrary DAG application
-policies or implement a general multi-call effect interpreter. The data model
-already supports multiple ordered children, shared service nodes, and arbitrary
-finite depth; those applications can extend the execution layer separately.
-
-`Proof/ApplicationExchange.lean` provides constructors and topology proofs for both current
-shapes: client → frontend with no backend call, and client → frontend → backend.
-They accept arbitrary byte records, request, and client source IP/port; they do
-not bake transport reliability or authorization into construction.
-`Proof/GraphExamples.lean` constructs a branching diamond with a shared receiving service and
-proves that the two requests to that service have distinct parent requests.
-
-`CodecContracts` remains deleted. The codec proof modules are unchanged and
-contain no admissions. Stable transport only equates sent and received bytes;
-`Requests`/`Replies` still connect those records with code output. Opaque IO,
-C, and OS behavior is not verified by these contracts.
-
-The final `remote_resource_iff_credentials` takes `input : ApplicationInput`,
-`contracts : Contracts input.exchange`, and `hRequest : ResourceRequest input.exchange`.
-It applies to the graph constructed by `input.exchange` and obtains topology
-from the construction theorem internally. No caller supplies a topology proof.
-The existing request restrictions remain; ordered address matching is now
-proved rather than assumed. No codec or authentication assumption was added. The proof modules contain no
-`sorry`, and the final theorem's axiom dependencies contain no `sorryAx`.
-
-The backend handler input comes from the received-byte parser by definition.
-`backend_decoded_fields` proves field preservation and complete consumption for
-every successful result of that parser, using the proved forwarding roundtrip.
-The response theorem
-applies to `resource target` by treating its JSON output simply as body bytes.
-The proved re-encoding lemmas reuse this result for the frontend response
-(`forwarded_resource_roundtrip`). The rejected branch continues to use the
-already proved fixed 401 roundtrip. Thus no separate frontend codec admission
-is needed.
-
-The response proof is built from these results:
-
-- `Proof/DecimalProofs.lean`: `(toString n).toNat? = some n` for every natural number.
-- `Proof/AsciiHTTPProofs.lean`: the actual legacy `splitOn` recovers ASCII rows joined
-  by CRLF and fields separated by a colon, under the stated separator conditions.
-- `Proof/TrimProofs.lean`: the actual `trimAscii` removes a prepended space and preserves
-  a value containing no whitespace; this applies to the generated decimal length.
-- `Proof/ResponseHeadProofs.lean`: the four JSON response lines are recovered,
-  `parseHeader` recovers Content-Length, and `findBytes` locates the first
-  CRLFCRLF at the end of the head. The prefix proof also excludes false matches
-  across concatenation boundaries.
-- `Proofv2.decode_json_frame`: UTF-8 decoding applies only to the head, the parsed
-  length matches the body size, and byte extraction returns the original body.
-  `json_response_roundtrip` connects this frame to the actual `encodeHTTP1`.
-
-The request proof is built from these results:
-
-- `Proof/StringJoinProofs.lean` and `Proof/HTTPStringProofs.lean`: the actual legacy `splitOn`
-  recovers fields and CRLF-separated rows using UTF-8 byte positions. These
-  lemmas support Unicode targets and values, empty colon-separated segments,
-  and values containing multiple colons.
-- `TrimProofs.trim_mem`: trimming only removes characters, preserving the
-  validity constraints of arbitrary header values.
-- `Proof/RequestHeadProofs.lean`: every serialized retained header parses successfully,
-  keeping its name and a valid, possibly normalized value. The actual encoder
-  produces the proved request line and header rows. The decoded Host is unique
-  and nonempty, Content-Length is unique, and Transfer-Encoding is absent.
-- `Proof/RequestFramingProofs.lean`: a UTF-8 encoding of a character other than CR
-  cannot contain byte 13; nonempty header rows therefore cannot create an early
-  CRLFCRLF, including at concatenation boundaries.
-- `Proof/HTTPDecimalProofs.lean`: the HTTP parser's stricter private decimal routine
-  accepts `toString n` and returns `n`. A local syntax bridge references the
-  existing legacy private constant for proof access; it adds no axiom or
-  replacement parser. Its name must track the codec's private name if that
-  module is reorganized.
-- `CodecProofs.forwarded_request_roundtrip`: the original parse supplies valid
-  fields, the existing constraints supply size bounds, and the actual parser
-  checks reduce to the proved header facts. It then extracts precisely the
-  original body and leaves no bytes unconsumed. No equality of whole requests
-  or of all header values is needed.
-
-`#print axioms` also confirms that `json_response_roundtrip`, `resource_roundtrip`,
-and `forwarded_resource_roundtrip` do not depend on `sorryAx`. Some fixed-string
-checks use Lean's `native_decide`, so these proofs include its native evaluation
-trust dependency. No new transport/runtime assumptions or codec premises were
-introduced. No arbitrary-header roundtrip or JSON serialization property is
-claimed.
-
-### Scope of the completed proof
-
-These proofs use the existing encoders and parsers. No service implementation,
-proxy behavior, or codec implementation was changed to make the proof succeed.
-The request theorem allows the original parse to take either the fixed-length
-or chunked branch; forwarding encodes the decoded body with Content-Length.
-
-Separately, the proxy's 1 MiB response-body limit needs a bound on the resource
-JSON produced from the target when verifying the IO reader. `decodeResponse`
-has no such limit and remains a specification observer. Runtime correspondence
-with IO, C, sockets, and the OS is still assumed. The pure roundtrip theorems do
-not verify that correspondence.
+This proves the specified graph's handler execution model under reliable system
+and network operations. It does not verify the deployed IO server, C, OS, or
+socket implementation, nor a refinement from the actual IO loops to this model.
+`decodeResponse` remains the complete-response specification observer; it is
+not the proxy's incremental `readBackendResponse` with its 1 MiB limit.
+Similarly, the theorem starts with complete request bytes and does not prove
+that every chunking of those bytes passes the real server's intermediate buffer
+limit. These IO correspondence obligations remain outside the theorem; they
+were not replaced by new premises. No service, proxy, or codec implementation
+was changed to make this proof succeed.

@@ -159,6 +159,10 @@ def wsCleanup : IO Unit := pure ()
 @[extern "lean_socket_create"]
 opaque socketCreate (proto : UInt32) : IO UInt64
 
+/-! Outbound TCP is used by small applications such as reverse proxies. -/
+@[extern "lean_socket_connect"]
+opaque socketConnect (host : @& String) (port : UInt32) : IO UInt64
+
 @[extern "lean_bind"]
 opaque socketBind (sock : UInt64) (port : UInt32) : IO Unit
 

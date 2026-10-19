@@ -1,0 +1,31 @@
+name = "frontend-backend2"
+version = "0.1.0"
+defaultTargets = ["frontend", "left", "right", "backend"]
+
+[[require]]
+name = "LeanServer"
+path = "../.."
+
+[[lean_lib]]
+name = "FrontendBackend2"
+roots = ["Proxy", "FrontendCore", "BackendCore", "Relay", "Proof.ServiceProofs", "Proof.ForwardingProofs", "Proof.ByteFramingProofs", "Proof.CodecProofs", "Proof.DecimalProofs", "Proof.AsciiHTTPProofs", "Proof.TrimProofs", "Proof.StringJoinProofs", "Proof.HTTPStringProofs", "Proof.RequestFramingProofs", "Proof.RequestHeadProofs", "Proof.HTTPDecimalProofs", "Proof.ResponseHeadProofs", "Proof.NetworkGraph", "Proof.NetworkExecution", "Proof.ApplicationGraph", "Proof.ResponseCodecProofs", "Proof.TwoHopProofs", "Proof.Proof"]
+
+[[lean_exe]]
+name = "frontend"
+root = "Frontend"
+
+[[lean_exe]]
+name = "left"
+root = "Left"
+
+[[lean_exe]]
+name = "right"
+root = "Right"
+
+[[lean_exe]]
+name = "backend"
+root = "Backend"
+
+[[lean_exe]]
+name = "network-tests"
+root = "Test.NetworkTests"

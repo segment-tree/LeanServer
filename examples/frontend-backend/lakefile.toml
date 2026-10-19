@@ -8,7 +8,7 @@ path = "../.."
 
 [[lean_lib]]
 name = "FrontendBackend"
-roots = ["Proxy", "FrontendCore", "BackendCore", "Proof.Proof", "Proof.ServiceProofs", "Proof.ForwardingProofs", "Proof.ByteFramingProofs", "Proof.CodecProofs", "Proof.DecimalProofs", "Proof.AsciiHTTPProofs", "Proof.TrimProofs", "Proof.StringJoinProofs", "Proof.HTTPStringProofs", "Proof.RequestFramingProofs", "Proof.RequestHeadProofs", "Proof.HTTPDecimalProofs", "Proof.ResponseHeadProofs", "Proof.ExchangeGraph", "Proof.ApplicationExchange", "Proof.Proofv2", "Proof.GraphExamples"]
+roots = ["Proxy", "FrontendCore", "BackendCore", "Proof.ServiceProofs", "Proof.ForwardingProofs", "Proof.ByteFramingProofs", "Proof.CodecProofs", "Proof.DecimalProofs", "Proof.AsciiHTTPProofs", "Proof.TrimProofs", "Proof.StringJoinProofs", "Proof.HTTPStringProofs", "Proof.RequestFramingProofs", "Proof.RequestHeadProofs", "Proof.HTTPDecimalProofs", "Proof.ResponseHeadProofs", "Proof.NetworkGraph", "Proof.NetworkExecution", "Proof.ApplicationGraph", "Proof.ResponseCodecProofs", "Proof.Proofv2", "Proof.GraphExamples"]
 
 [[lean_exe]]
 name = "frontend"

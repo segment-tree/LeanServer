@@ -1,55 +1,98 @@
-import Proof.ApplicationExchange
+import Proof.Proofv2
 
-namespace FrontendBackend.ExchangeGraph
+namespace FrontendBackend.Network
 
-private theorem five_edges (edge : Fin 5) :
-    edge = 0 ∨ edge = 1 ∨ edge = 2 ∨ edge = 3 ∨ edge = 4 := by omega
+open LeanServer.HTTP
+open FrontendBackend.Proofv2
 
-/-- A branching DAG with a shared receiving service:
-0 → 1 → 2 → 4 and 1 → 3 → 4. The two requests to node 4 have distinct parents.
-Program labels and byte records are arbitrary; no application policy is asserted. -/
-def diamond (programs : Fin 5 → Program) (traces : Fin 5 → ConnectionExchange) :
-    Exchange Program where
-  nodeCount := 5
-  edgeCount := 5
-  nodes := fun node => ⟨programs node, none, node.val⟩
-  upstream := fun edge =>
-    let endpoints : Fin 5 × Fin 5 :=
-      if edge = 0 then (0, 1) else if edge = 1 then (1, 2)
-      else if edge = 2 then (1, 3) else if edge = 3 then (2, 4) else (3, 4)
-    { caller := endpoints.1, callee := endpoints.2,
-      parent := if edge = 0 then none else if edge = 3 then some 1
-        else if edge = 4 then some 2 else some 0,
-      connection := traces edge, sourceIP := "", sourcePort := 0, responseClose := true }
-  entry := 0
-  children := fun edge => if edge = 0 then [1, 2]
-    else if edge = 1 then [3] else if edge = 2 then [4] else []
-  entryRoot := by simp
-  rootUnique := by
-    intro edge root
-    rcases five_edges edge with rfl | rfl | rfl | rfl | rfl <;> simp_all
-  parentConnected := by
-    intro edge parent h
-    rcases five_edges edge with rfl | rfl | rfl | rfl | rfl <;>
-      rcases five_edges parent with rfl | rfl | rfl | rfl | rfl <;> simp_all
-  childrenParent := by
-    intro parent child
-    rcases five_edges parent with rfl | rfl | rfl | rfl | rfl <;>
-      rcases five_edges child with rfl | rfl | rfl | rfl | rfl <;> simp
-  childrenUnique := by
-    intro parent
-    rcases five_edges parent with rfl | rfl | rfl | rfl | rfl <;> simp
-  increasing := by
-    intro edge
-    rcases five_edges edge with rfl | rfl | rfl | rfl | rfl <;> simp <;> decide
+private def addresses (node : Fin 4) : Upstream :=
+  ⟨"127.0.0.1", if node = (0 : Fin 4) then 8080 else if node = (1 : Fin 4) then 8082 else if node = (2 : Fin 4) then 8083 else 8081⟩
 
-/-- Sharing a service does not merge the two request executions. -/
-theorem diamond_shared_service (programs : Fin 5 → Program)
-    (traces : Fin 5 → ConnectionExchange) :
-    ((diamond programs traces).upstream (3 : Fin 5)).callee =
-      ((diamond programs traces).upstream (4 : Fin 5)).callee ∧
-    ((diamond programs traces).upstream (3 : Fin 5)).parent ≠
-      ((diamond programs traces).upstream (4 : Fin 5)).parent := by
-  simp [diamond]
+private def resolve (address : Upstream) : Option (Fin 4) :=
+  if address.host = "127.0.0.1" then
+    if address.port = 8080 then some (0 : Fin 4) else if address.port = 8082 then some (1 : Fin 4)
+    else if address.port = 8083 then some (2 : Fin 4) else if address.port = 8081 then some (3 : Fin 4) else none
+  else none
 
-end FrontendBackend.ExchangeGraph
+private theorem four_nodes (node : Fin 4) : node = (0 : Fin 4) ∨ node = (1 : Fin 4) ∨ node = (2 : Fin 4) ∨ node = (3 : Fin 4) := by omega
+
+/-- A fixed network with four services plus the special client. The two extra
+handlers are arbitrary. The network permits branches and a shared backend:
+client→frontend, frontend→left→backend, frontend→right→backend,
+and frontend→backend. The frontend's policy uses its direct backend route;
+unused routes remain part of the graph regardless of credentials. -/
+def diamond (source : Upstream) (left right : Handler AppM) : Graph where
+  nodes := [frontendWith callUpstream, left, right, backendCore]
+  addresses := addresses
+  resolve := resolve
+  resolves := by
+    intro node
+    change Fin 4 at node
+    rcases four_nodes node with rfl | rfl | rfl | rfl <;> rfl
+  resolvesOnly := by
+    intro address node resolved
+    change Fin 4 at node
+    rcases address with ⟨host, port⟩
+    simp only [resolve] at resolved
+    split at resolved
+    · split at resolved
+      · simp_all [addresses]
+      · split at resolved
+        · simp_all [addresses]
+          omega
+        · split at resolved
+          · have eq := Option.some.inj resolved
+            subst node
+            simp_all [addresses]
+          · split at resolved
+            · have eq := Option.some.inj resolved
+              subst node
+              simp_all [addresses]
+            · contradiction
+    · contradiction
+  clientAddress := source
+  entry := (0 : Fin 4)
+  routes := fun caller callee => match caller, callee with
+    | none, some node => node.val == 0
+    | some caller, some callee => caller.val < callee.val
+    | _, none => false
+  noIncomingClient := by intro node; cases node <;> rfl
+  rank := fun node => match node with
+    | none => 5
+    | some node => 4 - node.val
+  decreasing := by
+    intro caller callee connected
+    cases callee with
+    | none => cases caller <;> simp at connected
+    | some target =>
+      change Fin 4 at target
+      cases caller with
+      | none => simp only [beq_iff_eq] at connected; dsimp; omega
+      | some caller =>
+        simp only [decide_eq_true_eq] at connected
+        have := target.isLt
+        dsimp
+        omega
+
+theorem diamond_application (source : Upstream) (left right : Handler AppM) :
+    ApplicationNetwork (diamond source left right) (0 : Fin 4) (3 : Fin 4) := by
+  constructor <;> rfl
+
+/-- This instantiates the final theorem on a five-node network, with two
+unconstrained additional handlers. No three-node restriction is used. -/
+theorem diamond_resource_iff (source : Upstream) (left right : Handler AppM)
+    (contracts : Contracts (diamond source left right))
+    (wire : ByteArray) (request : ResourceInput wire) :
+    observed (diamond source left right) contracts wire = expectedResource wire ↔
+      credentialsMatch (context wire) = true :=
+  resource_iff_on_network _ contracts (0 : Fin 4) (3 : Fin 4)
+    (diamond_application source left right) wire request
+
+theorem diamond_unused_routes (source : Upstream) (left right : Handler AppM) :
+    (diamond source left right).routes (some (0 : Fin 4)) (some (1 : Fin 4)) = true ∧
+    (diamond source left right).routes (some (0 : Fin 4)) (some (2 : Fin 4)) = true ∧
+    (diamond source left right).routes (some (1 : Fin 4)) (some (3 : Fin 4)) = true ∧
+    (diamond source left right).routes (some (2 : Fin 4)) (some (3 : Fin 4)) = true := by
+  exact ⟨rfl, rfl, rfl, rfl⟩
+
+end FrontendBackend.Network
